@@ -6,7 +6,7 @@
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${workspaceRoot}/build/client.exe",
-            "args": [],
+            "args": ["172.16.0.227", "8080"],
             "cwd": "${workspaceRoot}",
             "console": "integratedTerminal"
         },

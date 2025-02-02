@@ -94,7 +94,7 @@ size_t receive_data(int sock, char *buffer, size_t buffer_size) {
 
 #define SAMPLE_RATE (48000)
 #define CHANNELS (1)
-#define RING_BUFFER_SIZE (SAMPLE_RATE * CHANNELS * 2) // 2 seconds of audio
+#define RING_BUFFER_SIZE (SAMPLE_RATE * CHANNELS * 10) // 2 seconds of audio
 
 struct RingBuffer {
     float buffer[RING_BUFFER_SIZE];
@@ -136,43 +136,50 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
 }
 
 void receive_audio_data() {
-    float tempBuffer[SAMPLE_RATE * CHANNELS];
+    const size_t metadata_size = sizeof(uint32_t) * 2; // Size of num_users and sample_count
+    const size_t max_audio_data_size = SAMPLE_RATE * CHANNELS * sizeof(float);
+    char packet[metadata_size + max_audio_data_size];
+
     while (1) {
-        // Read the number of users (metadata)
-        uint32_t num_users;
-        size_t bytes_received = receive_data(sock, (char*)&num_users, sizeof(num_users));
-        if (bytes_received != sizeof(num_users)) {
-            fprintf(stderr, "Failed to read num_users\n");
-            break;
+        // Receive the entire packet (metadata + audio data)
+        size_t bytes_received = receive_data(sock, packet, sizeof(packet));
+        if (bytes_received < metadata_size) {
+            fprintf(stderr, "Failed to receive complete metadata\n");
+            continue;
         }
 
-        // Read the sample count (metadata)
-        uint32_t sample_count;
-        bytes_received = receive_data(sock, (char*)&sample_count, sizeof(sample_count));
-        if (bytes_received != sizeof(sample_count)) {
-            fprintf(stderr, "Failed to read sample_count\n");
-            break;
+        // Extract metadata
+        uint32_t num_users = *reinterpret_cast<uint32_t*>(packet);
+        uint32_t sample_count = *reinterpret_cast<uint32_t*>(packet + sizeof(uint32_t));
+
+        // Calculate the size of the audio data
+        size_t audio_data_size = sample_count * sizeof(float);
+
+        // Ensure we received the complete audio data
+        if (bytes_received < metadata_size + audio_data_size) {
+            fprintf(stderr, "Failed to receive complete audio data\n");
+            continue;
         }
 
-        // Read the actual audio data
-        bytes_received = receive_data(sock, (char*)tempBuffer, sample_count * sizeof(float));
-        if (bytes_received > 0) {
-            size_t writeIndex = audioBuffer.writeIndex.load(std::memory_order_relaxed);
-            size_t readIndex = audioBuffer.readIndex.load(std::memory_order_acquire);
+        // Extract the audio data
+        float* audio_data = reinterpret_cast<float*>(packet + metadata_size);
 
-            size_t availableSpace = (readIndex > writeIndex) ? (readIndex - writeIndex - 1) : (RING_BUFFER_SIZE - writeIndex + readIndex - 1);
-            size_t toWrite = (availableSpace > sample_count) ? sample_count : availableSpace;
+        // Write the audio data to the ring buffer
+        size_t writeIndex = audioBuffer.writeIndex.load(std::memory_order_relaxed);
+        size_t readIndex = audioBuffer.readIndex.load(std::memory_order_acquire);
 
-            if (toWrite > 0) {
-                if (writeIndex + toWrite <= RING_BUFFER_SIZE) {
-                    memcpy(&audioBuffer.buffer[writeIndex], tempBuffer, toWrite * sizeof(float));
-                } else {
-                    size_t firstPart = RING_BUFFER_SIZE - writeIndex;
-                    memcpy(&audioBuffer.buffer[writeIndex], tempBuffer, firstPart * sizeof(float));
-                    memcpy(&audioBuffer.buffer[0], tempBuffer + firstPart, (toWrite - firstPart) * sizeof(float));
-                }
-                audioBuffer.writeIndex.store((writeIndex + toWrite) % RING_BUFFER_SIZE, std::memory_order_release);
+        size_t availableSpace = (readIndex > writeIndex) ? (readIndex - writeIndex - 1) : (RING_BUFFER_SIZE - writeIndex + readIndex - 1);
+        size_t toWrite = (availableSpace > sample_count) ? sample_count : availableSpace;
+
+        if (toWrite > 0) {
+            if (writeIndex + toWrite <= RING_BUFFER_SIZE) {
+                memcpy(&audioBuffer.buffer[writeIndex], audio_data, toWrite * sizeof(float));
+            } else {
+                size_t firstPart = RING_BUFFER_SIZE - writeIndex;
+                memcpy(&audioBuffer.buffer[writeIndex], audio_data, firstPart * sizeof(float));
+                memcpy(&audioBuffer.buffer[0], audio_data + firstPart, (toWrite - firstPart) * sizeof(float));
             }
+            audioBuffer.writeIndex.store((writeIndex + toWrite) % RING_BUFFER_SIZE, std::memory_order_release);
         }
     }
 }
