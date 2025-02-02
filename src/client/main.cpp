@@ -4,6 +4,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -14,12 +15,14 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string.h>
-#include <stdio.h>
 #endif
 
 #include <stdlib.h>
 
 #define BUFFER_SIZE 1024
+#define SAMPLE_RATE 44100
+#define CHANNELS 1
+#define FRAME_COUNT (1024)  // Adjust based on latency requirements
 
 void init_sockets() {
 #ifdef _WIN32
@@ -94,15 +97,10 @@ size_t receive_data(int sock, char *buffer, size_t buffer_size) {
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
-#define SAMPLE_RATE (48000)
-#define CHANNELS (1)
-
 int sock;
+std::atomic<bool> running{true};
 
-float* data;
-std::atomic_int32_t readCount;
-
-std::queue<float*> audioQueue;
+std::queue<std::vector<float>> audioQueue;
 std::mutex audioMutex;
 std::condition_variable audioCond;
 
@@ -112,25 +110,22 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
 
     std::unique_lock<std::mutex> lock(audioMutex);
     if (!audioQueue.empty()) {
-        float* receivedData = audioQueue.front();
-        memcpy(pOutput, receivedData, sizeof(float) * frameCount * CHANNELS);
+        std::vector<float> receivedData = std::move(audioQueue.front());
+        memcpy(pOutput, receivedData.data(), sizeof(float) * frameCount * CHANNELS);
         audioQueue.pop();
-        free(receivedData);
     } else {
         memset(pOutput, 0, sizeof(float) * frameCount * CHANNELS);
     }
 }
 
 void receive_audio_data() {
-    while (1) {
-        float* buffer = (float*)malloc(sizeof(float) * SAMPLE_RATE * CHANNELS);
-        size_t bytes_received = receive_data(sock, (char*)buffer, sizeof(float) * SAMPLE_RATE * CHANNELS);
+    std::vector<float> buffer(FRAME_COUNT * CHANNELS);
+    while (running) {
+        size_t bytes_received = receive_data(sock, (char*)buffer.data(), sizeof(float) * FRAME_COUNT * CHANNELS);
         if (bytes_received > 0) {
             std::unique_lock<std::mutex> lock(audioMutex);
             audioQueue.push(buffer);
             audioCond.notify_one();
-        } else {
-            free(buffer);
         }
     }
 }
@@ -146,7 +141,6 @@ int main(int argc, char* argv[])
     int server_port = atoi(argv[2]);
 
     init_sockets();
-    readCount.store(0);
 
     sock = create_socket();
     if (sock < 0) {
@@ -162,9 +156,6 @@ int main(int argc, char* argv[])
 
     printf("Connected to the server at %s:%d.\n", server_ip, server_port);
 
-    data = (float*)malloc(sizeof(float) * SAMPLE_RATE * CHANNELS);
-    memset(data, 0, sizeof(float) * SAMPLE_RATE * CHANNELS);
-
     ma_device_config config = ma_device_config_init(ma_device_type_duplex);
     config.capture.format    = ma_format_f32;
     config.capture.channels  = CHANNELS;
@@ -176,6 +167,8 @@ int main(int argc, char* argv[])
 
     ma_device device;
     if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
+        close_socket(sock);
+        cleanup_sockets();
         return -1;  // Failed to initialize the device.
     }
 
@@ -184,11 +177,12 @@ int main(int argc, char* argv[])
     std::thread receiverThread(receive_audio_data);
 
     // Main loop
-    while (1) {
-        // Keep the main thread alive
+    while (running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
+    running = false;
+    receiverThread.join();
     ma_device_uninit(&device);
     close_socket(sock);
     cleanup_sockets();

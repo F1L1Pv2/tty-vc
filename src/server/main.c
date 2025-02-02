@@ -45,7 +45,6 @@ void echo(void* arg){
         if(read_count <= 0){
             break;
         }
-        // printf("read %d\n", read_count);
         coroutine_sleep_write(client_fd);
         if(write(client_fd,buff,read_count) <= 0){
             break;
@@ -70,7 +69,6 @@ int main(int argc, char** argv){
         fprintf(stderr, "Invalid port: %d\n", port);
         exit(EXIT_FAILURE);
     }
-
 
     int server_fd, client_fd;
     struct sockaddr_in address;
