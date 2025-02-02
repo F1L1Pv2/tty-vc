@@ -37,6 +37,7 @@
 typedef struct {
     int fd;
     char* username;
+    bool init;
 } Client;
 
 typedef struct {
@@ -92,6 +93,7 @@ void broadcast_msg(void* arg){
     for(int i = 0; i < clients.count; i++){
         int client_fd = clients.items[i].fd;
         if(client_fd == info->from_fd) continue;
+        if(clients.items[i].init == false) continue;
         coroutine_sleep_write(client_fd);
         sprintf(msg,"[%s]: %s\n",from_username, info->msg);
         write(client_fd,msg,strlen(msg));
@@ -146,6 +148,7 @@ void client_init(void* arg){
     sprintf(welcomeMSG->msg,"%s has joined!",username);
     coroutine_go(broadcast_msg, welcomeMSG);
 
+    clients.items[index].init = true;
     coroutine_go(client_reader,arg);
     return;
 
@@ -251,6 +254,7 @@ int main(int argc, char** argv){
 
         Client c = {0};
         c.fd = client_fd;
+        c.init = false;
         da_append(&clients, c);
 
         printf("Connection accepted from %s:%d\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
