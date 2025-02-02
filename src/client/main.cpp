@@ -19,8 +19,6 @@
 
 #include <stdlib.h>
 
-#define SERVER_IP "127.0.0.1"
-#define SERVER_PORT 8080
 #define BUFFER_SIZE 1024
 
 void init_sockets() {
@@ -137,8 +135,16 @@ void receive_audio_data() {
     }
 }
 
-int main()
+int main(int argc, char* argv[])
 {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <server_ip> <server_port>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const char* server_ip = argv[1];
+    int server_port = atoi(argv[2]);
+
     init_sockets();
     readCount.store(0);
 
@@ -148,13 +154,13 @@ int main()
         return EXIT_FAILURE;
     }
 
-    if (connect_to_server(sock, SERVER_IP, SERVER_PORT) < 0) {
+    if (connect_to_server(sock, server_ip, server_port) < 0) {
         close_socket(sock);
         cleanup_sockets();
         return EXIT_FAILURE;
     }
 
-    printf("Connected to the server.\n");
+    printf("Connected to the server at %s:%d.\n", server_ip, server_port);
 
     data = (float*)malloc(sizeof(float) * SAMPLE_RATE * CHANNELS);
     memset(data, 0, sizeof(float) * SAMPLE_RATE * CHANNELS);
