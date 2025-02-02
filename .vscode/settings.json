@@ -86,7 +86,8 @@
         "3dmath.h": "c",
         "common.h": "c",
         "shaderdatastructuresconfig.h": "c",
-        "hash_map": "cpp"
+        "hash_map": "cpp",
+        "stdio.h": "c"
     },
     "nuxt.isNuxtApp": false,
     "C_Cpp.errorSquiggles": "disabled",

@@ -80,6 +80,7 @@ typedef enum {
     SM_NONE = 0,
     SM_READ,
     SM_WRITE,
+    SM_READ_WRITE,
 } Sleep_Mode;
 
 // Linux x86_64 call convention
@@ -116,6 +117,24 @@ void __attribute__((naked)) coroutine_sleep_read(int fd)
     "    movq %rdi, %rdx\n"     // fd
     "    movq %rsp, %rdi\n"     // rsp
     "    movq $1, %rsi\n"       // sm = SM_READ
+    "    jmp coroutine_switch_context\n");
+}
+
+void __attribute__((naked)) coroutine_sleep_read_write(int fd)
+{
+    (void) fd;
+    // @arch
+    asm(
+    "    pushq %rdi\n"
+    "    pushq %rbp\n"
+    "    pushq %rbx\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    movq %rdi, %rdx\n"     // fd
+    "    movq %rsp, %rdi\n"     // rsp
+    "    movq $3, %rsi\n"       // sm = SM_READ_WRITE
     "    jmp coroutine_switch_context\n");
 }
 
@@ -169,6 +188,13 @@ void coroutine_switch_context(void *rsp, Sleep_Mode sm, int fd)
     case SM_WRITE: {
         da_append(&asleep, active.items[current]);
         struct pollfd pfd = {.fd = fd, .events = POLLWRNORM,};
+        da_append(&polls, pfd);
+        da_remove_unordered(&active, current);
+    } break;
+
+    case SM_READ_WRITE: {
+        da_append(&asleep, active.items[current]);
+        struct pollfd pfd = {.fd = fd, .events = POLLRDNORM | POLLWRNORM,};
         da_append(&polls, pfd);
         da_remove_unordered(&active, current);
     } break;
