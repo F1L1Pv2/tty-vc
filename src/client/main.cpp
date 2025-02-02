@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <atomic>
 #include <thread>
-#include <cstring>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -17,6 +19,8 @@
 
 #include <stdlib.h>
 
+#define SERVER_IP "127.0.0.1"
+#define SERVER_PORT 8080
 #define BUFFER_SIZE 1024
 
 void init_sockets() {
@@ -82,7 +86,7 @@ size_t send_data(int sock, const char *data, size_t size) {
 
 size_t receive_data(int sock, char *buffer, size_t buffer_size) {
     memset(buffer, 0, buffer_size);
-    size_t bytes_received = recv(sock, buffer, buffer_size, 0);
+    size_t bytes_received = recv(sock, buffer, buffer_size - 1, 0);
     if (bytes_received < 0) {
         perror("Receive failed");
     }
@@ -94,112 +98,49 @@ size_t receive_data(int sock, char *buffer, size_t buffer_size) {
 
 #define SAMPLE_RATE (48000)
 #define CHANNELS (1)
-#define RING_BUFFER_SIZE (SAMPLE_RATE * CHANNELS * 10) // 2 seconds of audio
-
-struct RingBuffer {
-    float buffer[RING_BUFFER_SIZE];
-    std::atomic<size_t> writeIndex{0};
-    std::atomic<size_t> readIndex{0};
-};
-
-RingBuffer audioBuffer;
 
 int sock;
 
+float* data;
+std::atomic_int32_t readCount;
+
+std::queue<float*> audioQueue;
+std::mutex audioMutex;
+std::condition_variable audioCond;
+
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
 {
-    // Send audio data to the server
     send_data(sock, (const char*)pInput, sizeof(float) * frameCount * CHANNELS);
 
-    // Playback received audio data
-    float* output = (float*)pOutput;
-    size_t readIndex = audioBuffer.readIndex.load(std::memory_order_relaxed);
-    size_t writeIndex = audioBuffer.writeIndex.load(std::memory_order_acquire);
-
-    size_t available = (writeIndex >= readIndex) ? (writeIndex - readIndex) : (RING_BUFFER_SIZE - readIndex + writeIndex);
-    size_t toCopy = (available > frameCount * CHANNELS) ? frameCount * CHANNELS : available;
-
-    if (toCopy > 0) {
-        if (readIndex + toCopy <= RING_BUFFER_SIZE) {
-            memcpy(output, &audioBuffer.buffer[readIndex], toCopy * sizeof(float));
-        } else {
-            size_t firstPart = RING_BUFFER_SIZE - readIndex;
-            memcpy(output, &audioBuffer.buffer[readIndex], firstPart * sizeof(float));
-            memcpy(output + firstPart, &audioBuffer.buffer[0], (toCopy - firstPart) * sizeof(float));
-        }
-        audioBuffer.readIndex.store((readIndex + toCopy) % RING_BUFFER_SIZE, std::memory_order_release);
-    }
-
-    if (toCopy < frameCount * CHANNELS) {
-        memset(output + toCopy, 0, (frameCount * CHANNELS - toCopy) * sizeof(float));
+    std::unique_lock<std::mutex> lock(audioMutex);
+    if (!audioQueue.empty()) {
+        float* receivedData = audioQueue.front();
+        memcpy(pOutput, receivedData, sizeof(float) * frameCount * CHANNELS);
+        audioQueue.pop();
+        free(receivedData);
+    } else {
+        memset(pOutput, 0, sizeof(float) * frameCount * CHANNELS);
     }
 }
 
 void receive_audio_data() {
-    const size_t metadata_size = sizeof(uint32_t) * 2; // Size of num_users and sample_count
-    const size_t max_audio_data_size = SAMPLE_RATE * CHANNELS * sizeof(float);
-    char packet[metadata_size + max_audio_data_size];
-
     while (1) {
-        // Receive the entire packet (metadata + audio data)
-        size_t bytes_received = receive_data(sock, packet, sizeof(packet));
-        if (bytes_received < metadata_size) {
-            fprintf(stderr, "Failed to receive complete metadata\n");
-            continue;
-        }
-
-        // Extract metadata
-        uint32_t num_users = *reinterpret_cast<uint32_t*>(packet);
-        uint32_t sample_count = *reinterpret_cast<uint32_t*>(packet + sizeof(uint32_t));
-
-        // Calculate the size of the audio data
-        size_t audio_data_size = sample_count * sizeof(float);
-
-        // Ensure we received the complete audio data
-        if (bytes_received < metadata_size + audio_data_size) {
-            fprintf(stderr, "Failed to receive complete audio data\n");
-            continue;
-        }
-
-        // Extract the audio data
-        float* audio_data = reinterpret_cast<float*>(packet + metadata_size);
-
-        // Write the audio data to the ring buffer
-        size_t writeIndex = audioBuffer.writeIndex.load(std::memory_order_relaxed);
-        size_t readIndex = audioBuffer.readIndex.load(std::memory_order_acquire);
-
-        size_t availableSpace = (readIndex > writeIndex) ? (readIndex - writeIndex - 1) : (RING_BUFFER_SIZE - writeIndex + readIndex - 1);
-        size_t toWrite = (availableSpace > sample_count) ? sample_count : availableSpace;
-
-        if (toWrite > 0) {
-            if (writeIndex + toWrite <= RING_BUFFER_SIZE) {
-                memcpy(&audioBuffer.buffer[writeIndex], audio_data, toWrite * sizeof(float));
-            } else {
-                size_t firstPart = RING_BUFFER_SIZE - writeIndex;
-                memcpy(&audioBuffer.buffer[writeIndex], audio_data, firstPart * sizeof(float));
-                memcpy(&audioBuffer.buffer[0], audio_data + firstPart, (toWrite - firstPart) * sizeof(float));
-            }
-            audioBuffer.writeIndex.store((writeIndex + toWrite) % RING_BUFFER_SIZE, std::memory_order_release);
+        float* buffer = (float*)malloc(sizeof(float) * SAMPLE_RATE * CHANNELS);
+        size_t bytes_received = receive_data(sock, (char*)buffer, sizeof(float) * SAMPLE_RATE * CHANNELS);
+        if (bytes_received > 0) {
+            std::unique_lock<std::mutex> lock(audioMutex);
+            audioQueue.push(buffer);
+            audioCond.notify_one();
+        } else {
+            free(buffer);
         }
     }
 }
 
-int main(int argc, char** argv)
+int main()
 {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <server_ip> <server_port>\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    const char* server_ip = argv[1];
-    int server_port = atoi(argv[2]);
-
-    if (server_port <= 0 || server_port > 65535) {
-        fprintf(stderr, "Invalid port: %d\n", server_port);
-        return EXIT_FAILURE;
-    }
-
     init_sockets();
+    readCount.store(0);
 
     sock = create_socket();
     if (sock < 0) {
@@ -207,13 +148,16 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    if (connect_to_server(sock, server_ip, server_port) < 0) {
+    if (connect_to_server(sock, SERVER_IP, SERVER_PORT) < 0) {
         close_socket(sock);
         cleanup_sockets();
         return EXIT_FAILURE;
     }
 
-    printf("Connected to the server at %s:%d.\n", server_ip, server_port);
+    printf("Connected to the server.\n");
+
+    data = (float*)malloc(sizeof(float) * SAMPLE_RATE * CHANNELS);
+    memset(data, 0, sizeof(float) * SAMPLE_RATE * CHANNELS);
 
     ma_device_config config = ma_device_config_init(ma_device_type_duplex);
     config.capture.format    = ma_format_f32;
@@ -226,14 +170,16 @@ int main(int argc, char** argv)
 
     ma_device device;
     if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
-        return -1;
+        return -1;  // Failed to initialize the device.
     }
 
     ma_device_start(&device);
 
     std::thread receiverThread(receive_audio_data);
 
+    // Main loop
     while (1) {
+        // Keep the main thread alive
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 

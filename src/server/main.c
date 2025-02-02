@@ -34,109 +34,43 @@
 
 #define BUFFER_SIZE 1024
 
-typedef struct {
-    int fd;
-    struct sockaddr_in addr;
-} Client;
-
-typedef struct {
-    Client* items;
-    size_t count;
-    size_t capacity;
-} ClientArray;
-
-ClientArray clients = {0};
-
-typedef struct {
-    int sender_fd;
-    float* samples;
-    size_t sample_count;
-} AudioData;
-
-typedef struct {
-    AudioData* items;
-    size_t count;
-    size_t capacity;
-} AudioQueue;
-
-AudioQueue audio_queue = {0};
-
-void broadcast_audio_coroutine(void* arg) {
-    (void)arg; // Unused parameter
-
-    while (true) {
-        if (audio_queue.count > 0) {
-            AudioData data = audio_queue.items[0];
-
-            uint32_t num_users = clients.count - 1; // Exclude the sender
-            for (size_t i = 0; i < clients.count; i++) {
-                if (clients.items[i].fd != data.sender_fd) {
-                    write(clients.items[i].fd, &num_users, sizeof(num_users));
-                    uint32_t sample_count_net = data.sample_count;
-                    write(clients.items[i].fd, &sample_count_net, sizeof(sample_count_net));
-                    write(clients.items[i].fd, data.samples, data.sample_count * sizeof(float));
-                }
-            }
-
-            // Free the samples buffer after broadcasting
-            free(data.samples);
-
-            // Remove the processed item from the queue
-            da_remove_unordered(&audio_queue, 0);
-        } else {
-            // If the queue is empty, yield to other coroutines
-            coroutine_yield();
-        }
-    }
-}
-
-void handle_client(void* arg) {
+void echo(void* arg){
     int client_fd = (int)arg;
-    float* buffer = malloc(48000 * 2 * sizeof(float) + 128);
 
-    while (true) {
+    float* buff = malloc(48000*2*sizeof(float)+128);
+
+    while(true){
         coroutine_sleep_read(client_fd);
-        int read_count = read(client_fd, buffer, 48000 * 2 * sizeof(float) + 128);
-        if (read_count <= 0) {
+        int read_count = read(client_fd,buff,48000*2*sizeof(float)+128);
+        if(read_count <= 0){
             break;
         }
-
-        size_t sample_count = read_count / sizeof(float);
-
-        // Enqueue the audio data for broadcasting
-        AudioData data = {client_fd, buffer, sample_count};
-        da_append(&audio_queue, data);
-
-        // Allocate a new buffer for the next read
-        buffer = malloc(48000 * 2 * sizeof(float) + 128);
+        // printf("read %d\n", read_count);
+        coroutine_sleep_write(client_fd);
+        if(write(client_fd,buff,read_count) <= 0){
+            break;
+        }
     }
 
     printf("Client disconnected\n");
     close(client_fd);
-    free(buffer);
-
-    // Remove client from the list
-    for (size_t i = 0; i < clients.count; i++) {
-        if (clients.items[i].fd == client_fd) {
-            da_remove_unordered(&clients, i);
-            break;
-        }
-    }
+    free(buff);
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv){
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <hostname> <port>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
     coroutine_init();
 
-    const char* hostname = argv[1];
+    const char *hostname = argv[1];
     int port = atoi(argv[2]);
     if (port <= 0 || port > 65535) {
         fprintf(stderr, "Invalid port: %d\n", port);
         exit(EXIT_FAILURE);
     }
+
 
     int server_fd, client_fd;
     struct sockaddr_in address;
@@ -179,7 +113,7 @@ int main(int argc, char** argv) {
     }
 
     // Bind the socket to the network address and port
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed");
         close(server_fd);
         exit(EXIT_FAILURE);
@@ -192,14 +126,12 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
-    printf("Listening on %s:%d...\n", hostname, port);
+    printf("Listening on %s:%d...\n", hostname,port);
 
-    coroutine_go(broadcast_audio_coroutine, NULL);
-
-    while (true) {
+    while(true){
         coroutine_sleep_read(server_fd);
         // Accept a connection
-        if ((client_fd = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0) {
+        if ((client_fd = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
             perror("accept failed");
             close(server_fd);
             exit(EXIT_FAILURE);
@@ -219,11 +151,7 @@ int main(int argc, char** argv) {
         }
 
         printf("Connection accepted from %s:%d\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
-
-        Client new_client = {client_fd, address};
-        da_append(&clients, new_client);
-
-        coroutine_go(handle_client, (void*)client_fd);
+        coroutine_go(echo,(void*)client_fd);
     }
 
     // Close the server socket
