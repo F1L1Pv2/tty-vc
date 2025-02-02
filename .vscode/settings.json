@@ -87,7 +87,10 @@
         "common.h": "c",
         "shaderdatastructuresconfig.h": "c",
         "hash_map": "cpp",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "deque": "cpp",
+        "queue": "cpp",
+        "ranges": "cpp"
     },
     "nuxt.isNuxtApp": false,
     "C_Cpp.errorSquiggles": "disabled",

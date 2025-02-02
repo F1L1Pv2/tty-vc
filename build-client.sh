@@ -2,4 +2,4 @@
 
 set -xe
 
-clang src/client/main.c -o build/client.exe -I thirdparty
+clang++ -g src/client/main.cpp -o build/client.exe -I thirdparty
