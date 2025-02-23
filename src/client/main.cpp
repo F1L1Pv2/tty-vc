@@ -102,11 +102,25 @@ std::atomic<bool> running{true};
 
 std::queue<std::vector<float>> audioQueue;
 std::mutex audioMutex;
-std::condition_variable audioCond;
+
+struct SendPacket{
+    void* data;
+    size_t size;
+};
+
+std::mutex sendMutex;
+std::vector<SendPacket> sendPackets;
 
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
 {
-    send_data(sock, (const char*)pInput, sizeof(float) * frameCount * CHANNELS);
+    SendPacket packet;
+    packet.size = sizeof(float) * frameCount * CHANNELS;
+    packet.data = malloc(packet.size);
+    memcpy(packet.data,pInput,packet.size);
+    {
+        std::unique_lock<std::mutex> lock(sendMutex);
+        sendPackets.push_back(packet);
+    }
 
     std::unique_lock<std::mutex> lock(audioMutex);
     if (!audioQueue.empty()) {
@@ -118,6 +132,20 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
     }
 }
 
+void send_audio_data(){
+    while(running){
+        {
+            std::unique_lock<std::mutex> lock(sendMutex);
+            while(!sendPackets.empty()){
+                SendPacket& packet = sendPackets.front();
+                send_data(sock, (const char*)packet.data, packet.size);
+                free(packet.data);
+                sendPackets.erase(sendPackets.begin());
+            }
+        }
+    }
+}
+
 void receive_audio_data() {
     std::vector<float> buffer(FRAME_COUNT * CHANNELS);
     while (running) {
@@ -125,7 +153,6 @@ void receive_audio_data() {
         if (bytes_received > 0) {
             std::unique_lock<std::mutex> lock(audioMutex);
             audioQueue.push(buffer);
-            audioCond.notify_one();
         }
     }
 }
@@ -176,6 +203,8 @@ int main(int argc, char* argv[])
 
     std::thread receiverThread(receive_audio_data);
 
+    std::thread senderThread(send_audio_data);
+
     // Main loop
     while (running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -183,6 +212,7 @@ int main(int argc, char* argv[])
 
     running = false;
     receiverThread.join();
+    senderThread.join();
     ma_device_uninit(&device);
     close_socket(sock);
     cleanup_sockets();

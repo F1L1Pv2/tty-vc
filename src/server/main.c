@@ -7,8 +7,8 @@
 #include <malloc.h>
 #include <fcntl.h>
 #include <assert.h>
-
-#include <coroutine.h>
+#include <signal.h>
+#include <sys/prctl.h>
 
 #ifndef DA_INIT_CAP
 #define DA_INIT_CAP 256
@@ -34,19 +34,22 @@
 
 #define BUFFER_SIZE 1024
 
-void echo(void* arg){
-    int client_fd = (int)arg;
+void handle_client(int client_fd) {
+    // Ensure the child process dies when the parent process dies
+    if (prctl(PR_SET_PDEATHSIG, SIGHUP) == -1) {
+        perror("prctl failed");
+        exit(EXIT_FAILURE);
+    }
 
-    float* buff = malloc(48000*2*sizeof(float)+128);
+    float* buff = malloc(48000 * 2 * sizeof(float) + 128);
 
-    while(true){
-        coroutine_sleep_read(client_fd);
-        int read_count = read(client_fd,buff,48000*2*sizeof(float)+128);
-        if(read_count <= 0){
+    while (true) {
+        int read_count = read(client_fd, buff, 48000 * 2 * sizeof(float) + 128);
+        if (read_count <= 0) {
             break;
         }
-        coroutine_sleep_write(client_fd);
-        if(write(client_fd,buff,read_count) <= 0){
+
+        if (write(client_fd, buff, read_count) <= 0) {
             break;
         }
     }
@@ -54,14 +57,14 @@ void echo(void* arg){
     printf("Client disconnected\n");
     close(client_fd);
     free(buff);
+    exit(0); // Exit the child process after handling the client
 }
 
-int main(int argc, char** argv){
+int main(int argc, char** argv) {
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <hostname> <port>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
-    coroutine_init();
 
     const char *hostname = argv[1];
     int port = atoi(argv[2]);
@@ -83,19 +86,6 @@ int main(int argc, char** argv){
 
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    int flags = fcntl(server_fd, F_GETFL, 0);
-    if (flags == -1) {
-        perror("fcntl F_GETFL failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    if (fcntl(server_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        perror("fcntl F_SETFL failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
@@ -124,10 +114,12 @@ int main(int argc, char** argv){
         exit(EXIT_FAILURE);
     }
 
-    printf("Listening on %s:%d...\n", hostname,port);
+    printf("Listening on %s:%d...\n", hostname, port);
 
-    while(true){
-        coroutine_sleep_read(server_fd);
+    // Ignore SIGCHLD to avoid zombie processes
+    signal(SIGCHLD, SIG_IGN);
+
+    while (true) {
         // Accept a connection
         if ((client_fd = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
             perror("accept failed");
@@ -135,25 +127,24 @@ int main(int argc, char** argv){
             exit(EXIT_FAILURE);
         }
 
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        if (flags == -1) {
-            perror("fcntl F_GETFL failed");
-            close(client_fd);
-            continue;
-        }
-
-        if (fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-            perror("fcntl F_GETFL failed");
-            close(client_fd);
-            continue;
-        }
-
         printf("Connection accepted from %s:%d\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
-        coroutine_go(echo,(void*)client_fd);
+
+        // Fork a new process to handle the client
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork failed");
+            close(client_fd);
+        } else if (pid == 0) {
+            // Child process
+            close(server_fd); // Close the server socket in the child process
+            handle_client(client_fd);
+        } else {
+            // Parent process
+            close(client_fd); // Close the client socket in the parent process
+        }
     }
 
     // Close the server socket
     close(server_fd);
-    coroutine_finish();
     return 0;
 }
