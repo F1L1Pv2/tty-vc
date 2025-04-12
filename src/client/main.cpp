@@ -6,6 +6,8 @@
 #include <condition_variable>
 #include <vector>
 
+
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -17,6 +19,7 @@
 #include <string.h>
 #endif
 
+#include "../RingBuffer.h"
 #include <stdlib.h>
 
 #define BUFFER_SIZE 1024
@@ -100,16 +103,25 @@ size_t receive_data(int sock, char *buffer, size_t buffer_size) {
 int sock;
 std::atomic<bool> running{true};
 
-std::queue<std::vector<float>> audioQueue;
-std::mutex audioMutex;
+
+
 
 struct SendPacket{
     void* data;
     size_t size;
 };
 
-std::mutex sendMutex;
-std::vector<SendPacket> sendPackets;
+ContigousAsyncBuffer* audioQueue;
+ContigousAsyncBuffer* sendPackets;
+
+void mic_data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
+{
+    SendPacket packet;
+    packet.size = sizeof(float) * frameCount * CHANNELS;
+    packet.data = malloc(packet.size);
+    memcpy(packet.data,pInput,packet.size);
+    sendPackets->write(&packet,sizeof(SendPacket));
+}
 
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
 {
@@ -117,16 +129,15 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
     packet.size = sizeof(float) * frameCount * CHANNELS;
     packet.data = malloc(packet.size);
     memcpy(packet.data,pInput,packet.size);
-    {
-        std::unique_lock<std::mutex> lock(sendMutex);
-        sendPackets.push_back(packet);
-    }
+    sendPackets->write(&packet,sizeof(SendPacket));
 
-    std::unique_lock<std::mutex> lock(audioMutex);
-    if (!audioQueue.empty()) {
-        std::vector<float> receivedData = std::move(audioQueue.front());
-        memcpy(pOutput, receivedData.data(), sizeof(float) * frameCount * CHANNELS);
-        audioQueue.pop();
+    ContigousAsyncBufferItem item = audioQueue->read();
+
+    if (item.data != 0 && item.size != 0) {
+        memcpy(pOutput, item.data, item.size);
+        if(item.size < sizeof(float) * frameCount * CHANNELS){
+            memset((uint8_t*)pOutput+item.size, 0, (sizeof(float) * frameCount * CHANNELS) - item.size);
+        }
     } else {
         memset(pOutput, 0, sizeof(float) * frameCount * CHANNELS);
     }
@@ -135,12 +146,13 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
 void send_audio_data(){
     while(running){
         {
-            std::unique_lock<std::mutex> lock(sendMutex);
-            while(!sendPackets.empty()){
-                SendPacket& packet = sendPackets.front();
-                send_data(sock, (const char*)packet.data, packet.size);
-                free(packet.data);
-                sendPackets.erase(sendPackets.begin());
+
+            ContigousAsyncBufferItem item = sendPackets->read();
+
+            if (item.data != 0 && item.size == sizeof(SendPacket)) {
+                SendPacket* packet = (SendPacket*)item.data;
+                send_data(sock, (const char*)packet->data, packet->size);
+                free(packet->data);
             }
         }
     }
@@ -151,14 +163,16 @@ void receive_audio_data() {
     while (running) {
         size_t bytes_received = receive_data(sock, (char*)buffer.data(), sizeof(float) * FRAME_COUNT * CHANNELS);
         if (bytes_received > 0) {
-            std::unique_lock<std::mutex> lock(audioMutex);
-            audioQueue.push(buffer);
+            audioQueue->write(buffer.data(),bytes_received);
         }
     }
 }
 
 int main(int argc, char* argv[])
 {
+    audioQueue = new ContigousAsyncBuffer(SAMPLE_RATE*CHANNELS*BUFFER_SIZE);
+    sendPackets = new ContigousAsyncBuffer(sizeof(SendPacket)*BUFFER_SIZE);
+
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <server_ip> <server_port>\n", argv[0]);
         return EXIT_FAILURE;
@@ -216,5 +230,9 @@ int main(int argc, char* argv[])
     ma_device_uninit(&device);
     close_socket(sock);
     cleanup_sockets();
+
+    free(audioQueue);
+    free(sendPackets);
+
     return 0;
 }
