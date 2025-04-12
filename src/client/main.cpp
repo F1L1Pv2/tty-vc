@@ -5,10 +5,10 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
-
-
+#include <chrono>
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -25,7 +25,8 @@
 #define BUFFER_SIZE 1024
 #define SAMPLE_RATE 44100
 #define CHANNELS 1
-#define FRAME_COUNT (1024)  // Adjust based on latency requirements
+#define FRAME_COUNT 1024
+#define JITTER_BUFFER_SIZE 8 //  packets of buffering to handle network jitter
 
 void init_sockets() {
 #ifdef _WIN32
@@ -103,80 +104,101 @@ size_t receive_data(int sock, char *buffer, size_t buffer_size) {
 int sock;
 std::atomic<bool> running{true};
 
-
-
-
-struct SendPacket{
-    void* data;
-    size_t size;
+struct AudioPacket {
+    std::vector<float> data;
+    std::chrono::steady_clock::time_point timestamp;
 };
 
-ContigousAsyncBuffer* audioQueue;
-ContigousAsyncBuffer* sendPackets;
-
-void mic_data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
-{
-    SendPacket packet;
-    packet.size = sizeof(float) * frameCount * CHANNELS;
-    packet.data = malloc(packet.size);
-    memcpy(packet.data,pInput,packet.size);
-    sendPackets->write(&packet,sizeof(SendPacket));
-}
-
-void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
-{
-    SendPacket packet;
-    packet.size = sizeof(float) * frameCount * CHANNELS;
-    packet.data = malloc(packet.size);
-    memcpy(packet.data,pInput,packet.size);
-    sendPackets->write(&packet,sizeof(SendPacket));
-
-    ContigousAsyncBufferItem item = audioQueue->read();
-
-    if (item.data != 0 && item.size != 0) {
-        if(item.size > sizeof(float) * frameCount * CHANNELS){
-            memcpy(pOutput, item.data, sizeof(float) * frameCount * CHANNELS);
-            return;
+class JitterBuffer {
+private:
+    std::queue<AudioPacket> buffer;
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t max_size;
+    
+public:
+    JitterBuffer(size_t size) : max_size(size) {}
+    
+    void push(AudioPacket&& packet) {
+        std::unique_lock<std::mutex> lock(mtx);
+        if (buffer.size() >= max_size) {
+            buffer.pop(); // Drop oldest packet if buffer is full
         }
-        memcpy(pOutput, item.data, item.size);
-        if(item.size < sizeof(float) * frameCount * CHANNELS){
-            memset((uint8_t*)pOutput+item.size, 0, (sizeof(float) * frameCount * CHANNELS) - item.size);
+        buffer.push(std::move(packet));
+        cv.notify_one();
+    }
+    
+    bool pop(AudioPacket& packet) {
+        std::unique_lock<std::mutex> lock(mtx);
+        if (buffer.empty()) {
+            return false;
+        }
+        packet = std::move(buffer.front());
+        buffer.pop();
+        return true;
+    }
+    
+    void clear() {
+        std::unique_lock<std::mutex> lock(mtx);
+        while (!buffer.empty()) {
+            buffer.pop();
+        }
+    }
+    
+    size_t size() {
+        std::unique_lock<std::mutex> lock(mtx);
+        return buffer.size();
+    }
+};
+
+JitterBuffer jitterBuffer(JITTER_BUFFER_SIZE);
+
+void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    // Send microphone data
+    if (pInput) {
+        send_data(sock, reinterpret_cast<const char*>(pInput), 
+                 frameCount * CHANNELS * sizeof(float));
+    }
+    
+    // Playback received audio
+    AudioPacket packet;
+    if (jitterBuffer.pop(packet)) {
+        size_t samplesToCopy = std::min(packet.data.size(), static_cast<size_t>(frameCount * CHANNELS));
+        memcpy(pOutput, packet.data.data(), samplesToCopy * sizeof(float));
+        
+        // If we didn't get enough samples, fill the rest with silence
+        if (samplesToCopy < frameCount * CHANNELS) {
+            memset(reinterpret_cast<float*>(pOutput) + samplesToCopy, 0, 
+                  (frameCount * CHANNELS - samplesToCopy) * sizeof(float));
         }
     } else {
-        memset(pOutput, 0, sizeof(float) * frameCount * CHANNELS);
-    }
-}
-
-void send_audio_data(){
-    while(running){
-        {
-
-            ContigousAsyncBufferItem item = sendPackets->read();
-
-            if (item.data != 0 && item.size == sizeof(SendPacket)) {
-                SendPacket* packet = (SendPacket*)item.data;
-                send_data(sock, (const char*)packet->data, packet->size);
-                free(packet->data);
-            }
-        }
+        // No data available - output silence
+        memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
     }
 }
 
 void receive_audio_data() {
     std::vector<float> buffer(FRAME_COUNT * CHANNELS);
+    
     while (running) {
-        size_t bytes_received = receive_data(sock, (char*)buffer.data(), sizeof(float) * FRAME_COUNT * CHANNELS);
+        size_t bytes_received = receive_data(sock, reinterpret_cast<char*>(buffer.data()), 
+                                     buffer.size() * sizeof(float));
         if (bytes_received > 0) {
-            audioQueue->write(buffer.data(),bytes_received);
+            AudioPacket packet;
+            packet.data.resize(bytes_received / sizeof(float));
+            memcpy(packet.data.data(), buffer.data(), bytes_received);
+            packet.timestamp = std::chrono::steady_clock::now();
+            
+            jitterBuffer.push(std::move(packet));
+        } else if (bytes_received == 0) {
+            // Connection closed
+            running = false;
+            break;
         }
     }
 }
 
-int main(int argc, char* argv[])
-{
-    audioQueue = new ContigousAsyncBuffer(SAMPLE_RATE*CHANNELS*BUFFER_SIZE);
-    sendPackets = new ContigousAsyncBuffer(sizeof(SendPacket)*BUFFER_SIZE);
-
+int main(int argc, char* argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <server_ip> <server_port>\n", argv[0]);
         return EXIT_FAILURE;
@@ -192,6 +214,10 @@ int main(int argc, char* argv[])
         cleanup_sockets();
         return EXIT_FAILURE;
     }
+
+    // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
+    int flag = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
 
     if (connect_to_server(sock, server_ip, server_port) < 0) {
         close_socket(sock);
@@ -212,31 +238,43 @@ int main(int argc, char* argv[])
 
     ma_device device;
     if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
+        fprintf(stderr, "Failed to initialize audio device\n");
         close_socket(sock);
         cleanup_sockets();
-        return -1;  // Failed to initialize the device.
+        return EXIT_FAILURE;
     }
 
-    ma_device_start(&device);
+    if (ma_device_start(&device) != MA_SUCCESS) {
+        fprintf(stderr, "Failed to start audio device\n");
+        ma_device_uninit(&device);
+        close_socket(sock);
+        cleanup_sockets();
+        return EXIT_FAILURE;
+    }
 
     std::thread receiverThread(receive_audio_data);
 
-    std::thread senderThread(send_audio_data);
-
     // Main loop
     while (running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Monitor jitter buffer fill level
+        size_t buffer_size = jitterBuffer.size();
+        if (buffer_size < 1) {
+            // Buffer underrun - we might want to increase buffer size
+            printf("Warning: Jitter buffer underrun (%zu packets)\n", buffer_size);
+        } else if (buffer_size > JITTER_BUFFER_SIZE * 2) {
+            // Buffer overrun - we might want to drop some packets
+            printf("Warning: Jitter buffer overrun (%zu packets)\n", buffer_size);
+            jitterBuffer.clear();
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    running = false;
+    // Cleanup
     receiverThread.join();
-    senderThread.join();
     ma_device_uninit(&device);
     close_socket(sock);
     cleanup_sockets();
-
-    free(audioQueue);
-    free(sendPackets);
 
     return 0;
 }
