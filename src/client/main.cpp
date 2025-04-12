@@ -216,8 +216,10 @@ void cleanup_opus() {
     }
 }
 
-void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
-    // Send microphone data
+// Capture callback for microphone input
+void capture_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    (void)pOutput; // Unused in capture callback
+    
     if (pInput) {
         // Encode the audio with Opus
         unsigned char compressed_data[MAX_PACKET_SIZE];
@@ -233,8 +235,12 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
             fprintf(stderr, "Opus encode error: %s\n", opus_strerror(compressed_size));
         }
     }
+}
+
+// Playback callback for headphone output
+void playback_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    (void)pInput; // Unused in playback callback
     
-    // Playback received audio
     AudioPacket packet;
     if (jitterBuffer.pop(packet)) {
         float pcm_data[FRAME_SIZE * CHANNELS];
@@ -317,33 +323,65 @@ int main(int argc, char* argv[]) {
 
     printf("Connected to the server at %s:%d.\n", server_ip, server_port);
 
-    ma_device_config config = ma_device_config_init(ma_device_type_duplex);
-    config.capture.format    = ma_format_f32;
-    config.capture.channels  = CHANNELS;
-    config.playback.format   = ma_format_f32;
-    config.playback.channels = CHANNELS;
-    config.sampleRate        = SAMPLE_RATE;
-    config.dataCallback      = data_callback;
-    config.pUserData         = NULL;
-    config.periodSizeInFrames = FRAME_SIZE;
+    // Initialize separate capture (microphone) and playback (headphones) devices
+    ma_device_config capture_config = ma_device_config_init(ma_device_type_capture);
+    capture_config.capture.format   = ma_format_f32;
+    capture_config.capture.channels = CHANNELS;
+    capture_config.sampleRate      = SAMPLE_RATE;
+    capture_config.dataCallback    = capture_callback;
+    capture_config.periodSizeInFrames = FRAME_SIZE;
 
-    ma_device device;
-    if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
-        fprintf(stderr, "Failed to initialize audio device\n");
+    ma_device_config playback_config = ma_device_config_init(ma_device_type_playback);
+    playback_config.playback.format   = ma_format_f32;
+    playback_config.playback.channels = CHANNELS;
+    playback_config.sampleRate        = SAMPLE_RATE;
+    playback_config.dataCallback      = playback_callback;
+    playback_config.periodSizeInFrames = FRAME_SIZE;
+
+    ma_device capture_device;
+    ma_device playback_device;
+
+    // Start capture device (microphone)
+    if (ma_device_init(NULL, &capture_config, &capture_device) != MA_SUCCESS) {
+        fprintf(stderr, "Failed to initialize capture device\n");
         close_socket(sock);
         cleanup_opus();
         cleanup_sockets();
         return EXIT_FAILURE;
     }
 
-    if (ma_device_start(&device) != MA_SUCCESS) {
-        fprintf(stderr, "Failed to start audio device\n");
-        ma_device_uninit(&device);
+    if (ma_device_start(&capture_device) != MA_SUCCESS) {
+        fprintf(stderr, "Failed to start capture device\n");
+        ma_device_uninit(&capture_device);
         close_socket(sock);
         cleanup_opus();
         cleanup_sockets();
         return EXIT_FAILURE;
     }
+
+    // Start playback device (headphones)
+    if (ma_device_init(NULL, &playback_config, &playback_device) != MA_SUCCESS) {
+        fprintf(stderr, "Failed to initialize playback device\n");
+        ma_device_uninit(&capture_device);
+        close_socket(sock);
+        cleanup_opus();
+        cleanup_sockets();
+        return EXIT_FAILURE;
+    }
+
+    if (ma_device_start(&playback_device) != MA_SUCCESS) {
+        fprintf(stderr, "Failed to start playback device\n");
+        ma_device_uninit(&playback_device);
+        ma_device_uninit(&capture_device);
+        close_socket(sock);
+        cleanup_opus();
+        cleanup_sockets();
+        return EXIT_FAILURE;
+    }
+
+    printf("Audio devices initialized:\n");
+    printf("  Capture: %s\n", capture_device.capture.name);
+    printf("  Playback: %s\n", playback_device.playback.name);
 
     std::thread receiverThread(receive_audio_data);
 
@@ -365,7 +403,8 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     receiverThread.join();
-    ma_device_uninit(&device);
+    ma_device_uninit(&playback_device);
+    ma_device_uninit(&capture_device);
     close_socket(sock);
     cleanup_opus();
     cleanup_sockets();
