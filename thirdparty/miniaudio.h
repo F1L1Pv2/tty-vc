@@ -17826,7 +17826,7 @@ MA_API ma_handle ma_dlopen(ma_log* pLog, const char* filename)
         #else
             /* *sigh* It appears there is no ANSI version of LoadPackagedLibrary()... */
             WCHAR filenameW[4096];
-            if (MultiByteToWideChar(CP_UTF8, 0, filename, -1, filenameW, sizeof(filenameW)) == 0) {
+            if (MultiByteToWideChar(65001, 0, filename, -1, filenameW, sizeof(filenameW)) == 0) {
                 handle = NULL;
             } else {
                 handle = (ma_handle)LoadPackagedLibrary(filenameW, 0);
@@ -21550,7 +21550,7 @@ static ma_result ma_context_get_device_info_from_MMDevice__wasapi(ma_context* pC
             ma_PropVariantInit(&var);
             hr = ma_IPropertyStore_GetValue(pProperties, &MA_PKEY_Device_FriendlyName, &var);
             if (SUCCEEDED(hr)) {
-                WideCharToMultiByte(CP_UTF8, 0, var.pwszVal, -1, pInfo->name, sizeof(pInfo->name), 0, FALSE);
+                WideCharToMultiByte(65001, 0, var.pwszVal, -1, pInfo->name, sizeof(pInfo->name), 0, FALSE);
                 ma_PropVariantClear(pContext, &var);
             }
 
@@ -22449,7 +22449,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
             ma_PropVariantInit(&varName);
             hr = ma_IPropertyStore_GetValue(pProperties, &MA_PKEY_Device_FriendlyName, &varName);
             if (SUCCEEDED(hr)) {
-                WideCharToMultiByte(CP_UTF8, 0, varName.pwszVal, -1, pData->deviceName, sizeof(pData->deviceName), 0, FALSE);
+                WideCharToMultiByte(65001, 0, varName.pwszVal, -1, pData->deviceName, sizeof(pData->deviceName), 0, FALSE);
                 ma_PropVariantClear(pContext, &varName);
             }
 
@@ -25676,7 +25676,7 @@ static ma_result ma_context_get_device_info_from_WAVECAPS(ma_context* pContext, 
             char keyStr[1024];
             HKEY hKey;
 
-            WideCharToMultiByte(CP_UTF8, 0, guidStrW, -1, guidStr, sizeof(guidStr), 0, FALSE);
+            WideCharToMultiByte(65001, 0, guidStrW, -1, guidStr, sizeof(guidStr), 0, FALSE);
 
             ma_strcpy_s(keyStr, sizeof(keyStr), "SYSTEM\\CurrentControlSet\\Control\\MediaCategories\\");
             ma_strcat_s(keyStr, sizeof(keyStr), guidStr);

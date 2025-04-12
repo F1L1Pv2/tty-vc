@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <vector>
 #include <chrono>
+#include <opusfile/include/opusfile.h>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -20,14 +21,15 @@
 #include <netinet/tcp.h>
 #endif
 
-#include "../RingBuffer.h"
 #include <stdlib.h>
 
 #define BUFFER_SIZE 1024
-#define SAMPLE_RATE 44100
+#define SAMPLE_RATE 48000  // Opus native sample rate
 #define CHANNELS 1
-#define FRAME_COUNT 1024
-#define JITTER_BUFFER_SIZE 8 //  packets of buffering to handle network jitter
+#define FRAME_SIZE 960     // 20ms frames at 48kHz
+#define JITTER_BUFFER_SIZE 8 // packets of buffering to handle network jitter
+#define OPUS_APPLICATION OPUS_APPLICATION_VOIP
+#define MAX_PACKET_SIZE 1500
 
 void init_sockets() {
 #ifdef _WIN32
@@ -83,6 +85,14 @@ int connect_to_server(int sock, const char *server_ip, int server_port) {
 }
 
 size_t send_data(int sock, const char *data, size_t size) {
+    // First send the size of the packet (4 bytes)
+    uint32_t packet_size = htonl(static_cast<uint32_t>(size));
+    if (send(sock, reinterpret_cast<const char*>(&packet_size), sizeof(packet_size), 0) != sizeof(packet_size)) {
+        perror("Failed to send packet size");
+        return 0;
+    }
+    
+    // Then send the actual data
     size_t bytes_sent = send(sock, data, size, 0);
     if (bytes_sent < 0) {
         perror("Send failed");
@@ -91,8 +101,21 @@ size_t send_data(int sock, const char *data, size_t size) {
 }
 
 size_t receive_data(int sock, char *buffer, size_t buffer_size) {
-    memset(buffer, 0, buffer_size);
-    size_t bytes_received = recv(sock, buffer, buffer_size, 0);
+    // First receive the packet size
+    uint32_t packet_size;
+    if (recv(sock, reinterpret_cast<char*>(&packet_size), sizeof(packet_size), 0) != sizeof(packet_size)) {
+        perror("Failed to receive packet size");
+        return 0;
+    }
+    packet_size = ntohl(packet_size);
+    
+    if (packet_size > buffer_size) {
+        fprintf(stderr, "Packet too large: %u > %zu\n", packet_size, buffer_size);
+        return 0;
+    }
+    
+    // Then receive the actual data
+    size_t bytes_received = recv(sock, buffer, packet_size, 0);
     if (bytes_received < 0) {
         perror("Receive failed");
         return 0;
@@ -107,7 +130,7 @@ int sock;
 std::atomic<bool> running{true};
 
 struct AudioPacket {
-    std::vector<float> data;
+    std::vector<unsigned char> data; // Compressed Opus data
     std::chrono::steady_clock::time_point timestamp;
 };
 
@@ -155,23 +178,86 @@ public:
 
 JitterBuffer jitterBuffer(JITTER_BUFFER_SIZE);
 
+// Opus encoder and decoder
+OpusEncoder* encoder = nullptr;
+OpusDecoder* decoder = nullptr;
+
+void init_opus() {
+    int error;
+    
+    // Initialize encoder
+    encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION, &error);
+    if (error != OPUS_OK) {
+        fprintf(stderr, "Failed to create Opus encoder: %s\n", opus_strerror(error));
+        exit(EXIT_FAILURE);
+    }
+    
+    // Set encoder options
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(16000)); // 16 kbps for voice
+    opus_encoder_ctl(encoder, OPUS_SET_VBR(1)); // Enable VBR
+    opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(8)); // Max complexity for best quality
+    
+    // Initialize decoder
+    decoder = opus_decoder_create(SAMPLE_RATE, CHANNELS, &error);
+    if (error != OPUS_OK) {
+        fprintf(stderr, "Failed to create Opus decoder: %s\n", opus_strerror(error));
+        exit(EXIT_FAILURE);
+    }
+}
+
+void cleanup_opus() {
+    if (encoder) {
+        opus_encoder_destroy(encoder);
+        encoder = nullptr;
+    }
+    if (decoder) {
+        opus_decoder_destroy(decoder);
+        decoder = nullptr;
+    }
+}
+
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
     // Send microphone data
     if (pInput) {
-        send_data(sock, reinterpret_cast<const char*>(pInput), 
-                 frameCount * CHANNELS * sizeof(float));
+        // Encode the audio with Opus
+        unsigned char compressed_data[MAX_PACKET_SIZE];
+        int compressed_size = opus_encode_float(encoder, 
+                                              reinterpret_cast<const float*>(pInput), 
+                                              FRAME_SIZE, 
+                                              compressed_data, 
+                                              MAX_PACKET_SIZE);
+        
+        if (compressed_size > 0) {
+            send_data(sock, reinterpret_cast<const char*>(compressed_data), compressed_size);
+        } else {
+            fprintf(stderr, "Opus encode error: %s\n", opus_strerror(compressed_size));
+        }
     }
     
     // Playback received audio
     AudioPacket packet;
     if (jitterBuffer.pop(packet)) {
-        size_t samplesToCopy = std::min(packet.data.size(), static_cast<size_t>(frameCount * CHANNELS));
-        memcpy(pOutput, packet.data.data(), samplesToCopy * sizeof(float));
+        float pcm_data[FRAME_SIZE * CHANNELS];
+        int decoded_samples = opus_decode_float(decoder, 
+                                              packet.data.data(), 
+                                              packet.data.size(), 
+                                              pcm_data, 
+                                              FRAME_SIZE, 
+                                              0);
         
-        // If we didn't get enough samples, fill the rest with silence
-        if (samplesToCopy < frameCount * CHANNELS) {
-            memset(reinterpret_cast<float*>(pOutput) + samplesToCopy, 0, 
-                  (frameCount * CHANNELS - samplesToCopy) * sizeof(float));
+        if (decoded_samples > 0) {
+            size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
+                                           static_cast<size_t>(frameCount * CHANNELS));
+            memcpy(pOutput, pcm_data, samplesToCopy * sizeof(float));
+            
+            // If we didn't get enough samples, fill the rest with silence
+            if (samplesToCopy < frameCount * CHANNELS) {
+                memset(reinterpret_cast<float*>(pOutput) + samplesToCopy, 0, 
+                      (frameCount * CHANNELS - samplesToCopy) * sizeof(float));
+            }
+        } else {
+            fprintf(stderr, "Opus decode error: %s\n", opus_strerror(decoded_samples));
+            memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
         }
     } else {
         // No data available - output silence
@@ -180,23 +266,17 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
 }
 
 void receive_audio_data() {
-    const size_t buffer_size = FRAME_COUNT * CHANNELS * sizeof(float);
-    std::vector<char> receive_buffer(buffer_size);
+    std::vector<unsigned char> receive_buffer(MAX_PACKET_SIZE);
     
     while (running) {
-        size_t bytes_received = receive_data(sock, receive_buffer.data(), buffer_size);
+        size_t bytes_received = receive_data(sock, reinterpret_cast<char*>(receive_buffer.data()), 
+                                            receive_buffer.size());
         if (bytes_received > 0) {
-            // Only process if we got a complete frame (or multiple of float size)
-            if (bytes_received % sizeof(float) == 0) {
-                AudioPacket packet;
-                packet.data.resize(bytes_received / sizeof(float));
-                memcpy(packet.data.data(), receive_buffer.data(), bytes_received);
-                packet.timestamp = std::chrono::steady_clock::now();
-                
-                jitterBuffer.push(std::move(packet));
-            } else {
-                printf("Warning: Received incomplete audio frame (%zu bytes)\n", bytes_received);
-            }
+            AudioPacket packet;
+            packet.data.assign(receive_buffer.begin(), receive_buffer.begin() + bytes_received);
+            packet.timestamp = std::chrono::steady_clock::now();
+            
+            jitterBuffer.push(std::move(packet));
         } else if (bytes_received == 0) {
             // Connection closed
             running = false;
@@ -215,9 +295,11 @@ int main(int argc, char* argv[]) {
     int server_port = atoi(argv[2]);
 
     init_sockets();
+    init_opus();
 
     sock = create_socket();
     if (sock < 0) {
+        cleanup_opus();
         cleanup_sockets();
         return EXIT_FAILURE;
     }
@@ -228,6 +310,7 @@ int main(int argc, char* argv[]) {
 
     if (connect_to_server(sock, server_ip, server_port) < 0) {
         close_socket(sock);
+        cleanup_opus();
         cleanup_sockets();
         return EXIT_FAILURE;
     }
@@ -242,11 +325,13 @@ int main(int argc, char* argv[]) {
     config.sampleRate        = SAMPLE_RATE;
     config.dataCallback      = data_callback;
     config.pUserData         = NULL;
+    config.periodSizeInFrames = FRAME_SIZE;
 
     ma_device device;
     if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
         fprintf(stderr, "Failed to initialize audio device\n");
         close_socket(sock);
+        cleanup_opus();
         cleanup_sockets();
         return EXIT_FAILURE;
     }
@@ -255,6 +340,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to start audio device\n");
         ma_device_uninit(&device);
         close_socket(sock);
+        cleanup_opus();
         cleanup_sockets();
         return EXIT_FAILURE;
     }
@@ -281,6 +367,7 @@ int main(int argc, char* argv[]) {
     receiverThread.join();
     ma_device_uninit(&device);
     close_socket(sock);
+    cleanup_opus();
     cleanup_sockets();
 
     return 0;

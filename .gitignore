@@ -1,1 +1,8 @@
 build/*
+nob
+*.exe
+*.old
+*.lib
+*.o
+*.d
+*.so
