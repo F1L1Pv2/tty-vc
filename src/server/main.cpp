@@ -7,27 +7,35 @@
 #include <malloc.h>
 #include <fcntl.h>
 #include <assert.h>
-#include <signal.h>
-#include <sys/prctl.h>
-#include <sys/wait.h>
+#include <pthread.h>
+#include <sys/socket.h>
 
 #define MAX_CLIENTS 2
 
 typedef struct {
     int fd;
     struct sockaddr_in addr;
+    int index;
+    bool active;
+    pthread_t thread_id;
 } client_info;
 
 client_info clients[MAX_CLIENTS];
 int client_count = 0;
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void handle_client(int client_fd, int client_index) {
-    if (prctl(PR_SET_PDEATHSIG, SIGHUP) == -1) {
-        perror("prctl failed");
-        exit(EXIT_FAILURE);
-    }
+void *handle_client(void *arg) {
+    client_info *client = (client_info *)arg;
+    int client_fd = client->fd;
+    int client_index = client->index;
 
+    printf("Thread started for client %d\n", client_index);
+    
     float* buff = (float*)malloc(48000 * 2 * sizeof(float) + 128);
+    if (!buff) {
+        perror("malloc failed");
+        goto cleanup;
+    }
 
     while (true) {
         int read_count = read(client_fd, buff, 48000 * 2 * sizeof(float) + 128);
@@ -35,29 +43,39 @@ void handle_client(int client_fd, int client_index) {
             break;
         }
 
+        pthread_mutex_lock(&clients_mutex);
+        
         if (client_count == 1) {
             // Echo mode - single client
             if (write(client_fd, buff, read_count) <= 0) {
+                pthread_mutex_unlock(&clients_mutex);
                 break;
             }
         } else if (client_count == 2) {
             // Forward mode - send to other client
             int other_index = (client_index == 0) ? 1 : 0;
-            if (write(clients[other_index].fd, buff, read_count) <= 0) {
-                break;
+            if (clients[other_index].active) {
+                if (write(clients[other_index].fd, buff, read_count) <= 0) {
+                    pthread_mutex_unlock(&clients_mutex);
+                    break;
+                }
             }
         }
+        
+        pthread_mutex_unlock(&clients_mutex);
     }
 
+cleanup:
     printf("Client %d disconnected\n", client_index);
-    close(client_fd);
     free(buff);
     
-    // Remove client from array
-    clients[client_index].fd = -1;
+    pthread_mutex_lock(&clients_mutex);
+    close(client_fd);
+    client->active = false;
     client_count--;
+    pthread_mutex_unlock(&clients_mutex);
     
-    exit(0);
+    return NULL;
 }
 
 int main(int argc, char** argv) {
@@ -81,6 +99,8 @@ int main(int argc, char** argv) {
     // Initialize client array
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].fd = -1;
+        clients[i].active = false;
+        clients[i].index = i;
     }
 
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
@@ -117,8 +137,6 @@ int main(int argc, char** argv) {
 
     printf("Listening on %s:%d...\n", hostname, port);
 
-    signal(SIGCHLD, SIG_IGN);
-
     while (true) {
         int client_fd;
         struct sockaddr_in client_addr;
@@ -129,17 +147,20 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        pthread_mutex_lock(&clients_mutex);
+        
         if (client_count >= MAX_CLIENTS) {
             printf("Rejected connection from %s:%d (max clients reached)\n", 
                   inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
             close(client_fd);
+            pthread_mutex_unlock(&clients_mutex);
             continue;
         }
 
         // Find empty slot
         int client_index = -1;
         for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].fd == -1) {
+            if (!clients[i].active) {
                 client_index = i;
                 break;
             }
@@ -147,31 +168,32 @@ int main(int argc, char** argv) {
 
         if (client_index == -1) {
             close(client_fd);
+            pthread_mutex_unlock(&clients_mutex);
             continue;
         }
 
         // Store client info
         clients[client_index].fd = client_fd;
         clients[client_index].addr = client_addr;
+        clients[client_index].active = true;
         client_count++;
 
         printf("Connection accepted from %s:%d (client %d/%d)\n", 
               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port),
               client_count, MAX_CLIENTS);
 
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork failed");
-            clients[client_index].fd = -1;
+        // Create thread
+        if (pthread_create(&clients[client_index].thread_id, NULL, handle_client, &clients[client_index]) != 0) {
+            perror("pthread_create failed");
+            clients[client_index].active = false;
             client_count--;
             close(client_fd);
-        } else if (pid == 0) {
-            close(server_fd);
-            handle_client(client_fd, client_index);
         } else {
-            // Parent doesn't need this FD
-            close(client_fd);
+            // Detach the thread so we don't need to join it later
+            pthread_detach(clients[client_index].thread_id);
         }
+        
+        pthread_mutex_unlock(&clients_mutex);
     }
 
     close(server_fd);

@@ -92,7 +92,7 @@ size_t send_data(int sock, const char *data, size_t size) {
 
 size_t receive_data(int sock, char *buffer, size_t buffer_size) {
     memset(buffer, 0, buffer_size);
-    ssize_t bytes_received = recv(sock, buffer, buffer_size, 0);
+    size_t bytes_received = recv(sock, buffer, buffer_size, 0);
     if (bytes_received < 0) {
         perror("Receive failed");
         return 0;
