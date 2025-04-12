@@ -163,19 +163,11 @@ void send_audio_data(){
 }
 
 void receive_audio_data() {
-    std::vector<float> buffer;
-    std::vector<float> bufferRecv(FRAME_COUNT * CHANNELS);
+    std::vector<float> buffer(FRAME_COUNT * CHANNELS);
     while (running) {
-        size_t bytes_received = receive_data(sock, (char*)bufferRecv.data(), sizeof(float) * FRAME_COUNT * CHANNELS);
-        buffer.insert(buffer.end(), bufferRecv.begin(), bufferRecv.end());
+        size_t bytes_received = receive_data(sock, (char*)buffer.data(), sizeof(float) * FRAME_COUNT * CHANNELS);
         if (bytes_received > 0) {
-            if(buffer.size() > FRAME_COUNT * CHANNELS){
-                audioQueue->write(buffer.data(),sizeof(float) * FRAME_COUNT * CHANNELS);
-                buffer.erase(buffer.begin(), buffer.begin() + FRAME_COUNT * CHANNELS);
-            }else{
-                audioQueue->write(buffer.data(),bytes_received);
-                buffer.clear();
-            }
+            audioQueue->write(buffer.data(),bytes_received);
         }
     }
 }
