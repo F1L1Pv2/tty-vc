@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string.h>
+#include <netinet/tcp.h>
 #endif
 
 #include "../RingBuffer.h"
@@ -91,11 +92,12 @@ size_t send_data(int sock, const char *data, size_t size) {
 
 size_t receive_data(int sock, char *buffer, size_t buffer_size) {
     memset(buffer, 0, buffer_size);
-    size_t bytes_received = recv(sock, buffer, buffer_size - 1, 0);
+    ssize_t bytes_received = recv(sock, buffer, buffer_size, 0);
     if (bytes_received < 0) {
         perror("Receive failed");
+        return 0;
     }
-    return bytes_received;
+    return static_cast<size_t>(bytes_received);
 }
 
 #define MINIAUDIO_IMPLEMENTATION
@@ -178,18 +180,23 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
 }
 
 void receive_audio_data() {
-    std::vector<float> buffer(FRAME_COUNT * CHANNELS);
+    const size_t buffer_size = FRAME_COUNT * CHANNELS * sizeof(float);
+    std::vector<char> receive_buffer(buffer_size);
     
     while (running) {
-        size_t bytes_received = receive_data(sock, reinterpret_cast<char*>(buffer.data()), 
-                                     buffer.size() * sizeof(float));
+        size_t bytes_received = receive_data(sock, receive_buffer.data(), buffer_size);
         if (bytes_received > 0) {
-            AudioPacket packet;
-            packet.data.resize(bytes_received / sizeof(float));
-            memcpy(packet.data.data(), buffer.data(), bytes_received);
-            packet.timestamp = std::chrono::steady_clock::now();
-            
-            jitterBuffer.push(std::move(packet));
+            // Only process if we got a complete frame (or multiple of float size)
+            if (bytes_received % sizeof(float) == 0) {
+                AudioPacket packet;
+                packet.data.resize(bytes_received / sizeof(float));
+                memcpy(packet.data.data(), receive_buffer.data(), bytes_received);
+                packet.timestamp = std::chrono::steady_clock::now();
+                
+                jitterBuffer.push(std::move(packet));
+            } else {
+                printf("Warning: Received incomplete audio frame (%zu bytes)\n", bytes_received);
+            }
         } else if (bytes_received == 0) {
             // Connection closed
             running = false;
