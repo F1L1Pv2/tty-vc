@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <netinet/tcp.h>
+#include <netdb.h>
 #endif
 
 #include <stdlib.h>
@@ -67,14 +68,27 @@ void close_socket(int sock) {
 #endif
 }
 
-int connect_to_server(int sock, const char *server_ip, int server_port) {
+int connect_to_server(int sock, const char *server_name, int server_port) {
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);
-    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
-        perror("Invalid address or address not supported");
-        return -1;
+
+    // First try to interpret as IP address
+    if (inet_pton(AF_INET, server_name, &server_addr.sin_addr) <= 0) {
+        // If not an IP address, try to resolve as hostname
+        struct hostent *he = gethostbyname(server_name);
+        if (he == NULL) {
+#ifdef _WIN32
+            fprintf(stderr, "gethostbyname failed with error: %d\n", WSAGetLastError());
+#else
+            herror("gethostbyname failed");
+#endif
+            return -1;
+        }
+        
+        // Take the first address
+        memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
     }
 
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
@@ -293,11 +307,11 @@ void receive_audio_data() {
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <server_ip> <server_port>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <server_hostname_or_ip> <server_port>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    const char* server_ip = argv[1];
+    const char* server_name = argv[1];
     int server_port = atoi(argv[2]);
 
     init_sockets();
@@ -314,14 +328,14 @@ int main(int argc, char* argv[]) {
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
 
-    if (connect_to_server(sock, server_ip, server_port) < 0) {
+    if (connect_to_server(sock, server_name, server_port) < 0) {
         close_socket(sock);
         cleanup_opus();
         cleanup_sockets();
         return EXIT_FAILURE;
     }
 
-    printf("Connected to the server at %s:%d.\n", server_ip, server_port);
+    printf("Connected to the server at %s:%d.\n", server_name, server_port);
 
     // Initialize separate capture (microphone) and playback (headphones) devices
     ma_device_config capture_config = ma_device_config_init(ma_device_type_capture);
@@ -391,10 +405,10 @@ int main(int argc, char* argv[]) {
         size_t buffer_size = jitterBuffer.size();
         if (buffer_size < 1) {
             // Buffer underrun - we might want to increase buffer size
-            printf("Warning: Jitter buffer underrun (%zu packets)\n", buffer_size);
+            // printf("Warning: Jitter buffer underrun (%zu packets)\n", buffer_size);
         } else if (buffer_size > JITTER_BUFFER_SIZE * 2) {
             // Buffer overrun - we might want to drop some packets
-            printf("Warning: Jitter buffer overrun (%zu packets)\n", buffer_size);
+            // printf("Warning: Jitter buffer overrun (%zu packets)\n", buffer_size);
             jitterBuffer.clear();
         }
         
