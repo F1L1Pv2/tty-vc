@@ -213,10 +213,98 @@ defer:
     return result;
 }
 
+void usage(char* program){
+    printf("[USAGE]: %s (client) (server)\n", program);
+}
+
 int main(int argc, char** argv){
     NOB_GO_REBUILD_URSELF(argc,argv);
 
+    char* program = shift_args(&argc, &argv);
+    
+    bool build_client = true;
+    bool build_server = true;
+
+    while (argc > 0){
+        char* arg = shift_args(&argc,&argv);
+        if(strcmp(arg,"client") == 0){
+            build_client = true;
+        }
+
+        if(strcmp(arg,"server") == 0){
+            build_client = false;
+        }
+
+        if(strcmp(arg, "help") == 0){
+            usage(program);
+            return 0;
+        }
+    }
+
     if(!build_third_party()) return 1;
+
+    mkdir_if_not_exists("build");
+
+    int result = needs_rebuild1(
+#ifdef _WIN32
+        "build/client.exe",
+#else
+        "build/client",
+#endif
+        "src/client/main.cpp"
+    );
+
+    if(result < 0) return 1;
+
+    if(build_client && result){
+        cmd.count = 0;
+        cmd_append(&cmd,
+           "clang++",
+           "-g",
+           "src/client/main.cpp",
+           "-o",
+#ifdef _WIN32
+           "build/client.exe",
+#else
+            "build/client",
+#endif
+           "-I",
+           "thirdparty",
+           "-I",
+           "thirdparty/ogg/include",
+           "-I",
+           "thirdparty/opus/include",
+           "-L",
+           "thirdparty",
+           "-lopusfile",
+        );
+
+        if(!cmd_run_sync_and_reset(&cmd)) return 1;
+    }
+
+
+    result = 
+#ifndef _WIN32
+    needs_rebuild1(
+        "build/server",
+        "src/server/main.c"
+    );
+#else
+    1;
+#endif
+
+    if(result < 0) return 1;
+
+    if(build_server && result){
+#ifndef _WIN32
+        cmd.count = 0;
+
+        cmd_append(&cmd, "clang", "src/server/main.c", "-o", "build/server");
+        if(!cmd_run_sync_and_reset(&cmd)) return 1;
+#else
+        printf("Building server on windows is not supported (who would use windows for server anyways)\n");
+#endif
+    }
 
     return 0;
 }

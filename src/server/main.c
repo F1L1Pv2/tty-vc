@@ -9,6 +9,8 @@
 #include <assert.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#define NOB_IMPLEMENATION
+#include "../../nob.h"
 
 #define MAX_CLIENTS 2
 
@@ -19,6 +21,9 @@ typedef struct {
     bool active;
     pthread_t thread_id;
 } client_info;
+
+
+bool echoMode = false;
 
 client_info clients[MAX_CLIENTS];
 int client_count = 0;
@@ -45,7 +50,7 @@ void *handle_client(void *arg) {
 
         pthread_mutex_lock(&clients_mutex);
         
-        if (client_count == 1) {
+        if (client_count == 1 && echoMode) {
             // Echo mode - single client
             if (write(client_fd, buff, read_count) <= 0) {
                 pthread_mutex_unlock(&clients_mutex);
@@ -78,17 +83,28 @@ cleanup:
     return NULL;
 }
 
-int main(int argc, char** argv) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <hostname> <port>\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
+void usage(char* program){
+    fprintf(stderr, "Usage: %s <hostname> <port>\n", program);
+    exit(1);
+}
 
-    const char *hostname = argv[1];
-    int port = atoi(argv[2]);
+int main(int argc, char** argv) {
+    char* program = nob_shift_args(&argc,&argv);
+
+    if(argc == 0) usage(program);
+    char *hostname = nob_shift_args(&argc,&argv);
+    if(argc == 0) usage(program);
+    int port = atoi(nob_shift_args(&argc,&argv));
     if (port <= 0 || port > 65535) {
         fprintf(stderr, "Invalid port: %d\n", port);
         exit(EXIT_FAILURE);
+    }
+
+    while (argc > 0){
+        char* arg = nob_shift_args(&argc,&argv);
+        if(strcmp(arg, "echo") == 0){
+            echoMode = true;
+        }
     }
 
     int server_fd;
