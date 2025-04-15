@@ -274,7 +274,6 @@ int main(int argc, char** argv){
            "thirdparty/ogg/include",
            "-I",
            "thirdparty/opus/include",
-           "-Wno-tautological-constant-out-of-range-compare",
            "-L",
            "thirdparty",
            "-lopusfile",

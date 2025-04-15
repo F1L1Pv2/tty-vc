@@ -10,11 +10,9 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #define NOB_IMPLEMENATION
-#include "../nob.h"
+#include "../../nob.h"
 
-#include "common.h"
-
-#define MAX_CLIENTS 10
+#define MAX_CLIENTS 2
 
 typedef struct {
     int fd;
@@ -31,86 +29,44 @@ client_info clients[MAX_CLIENTS];
 int client_count = 0;
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-ssize_t read_all(int fd, void *buf, size_t count) {
-    size_t received = 0;
-    while (received < count) {
-        ssize_t n = read(fd, (char*)buf + received, count - received);
-        if (n <= 0) return n;
-        received += n;
-    }
-    return received;
-}
-
-ssize_t send_all(int fd, const void *buf, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = write(fd, (char*)buf + sent, len - sent);
-        if (n <= 0) return n;
-        sent += n;
-    }
-    return sent;
-}
-
 void *handle_client(void *arg) {
     client_info *client = (client_info *)arg;
     int client_fd = client->fd;
     int client_index = client->index;
 
-    unsigned char* buff = (unsigned char*)malloc(MAX_PACKET_SIZE);
-    if (!buff) { /* handle error */ }
+    printf("Thread started for client %d\n", client_index);
+    
+    float* buff = (float*)malloc(48000 * 2 * sizeof(float) + 128);
+    if (!buff) {
+        perror("malloc failed");
+        goto cleanup;
+    }
 
-    while (1) {
-        // Read packet size
-        uint32_t packet_size;
-        if (read_all(client_fd, &packet_size, 4) != 4) break;
-        packet_size = ntohl(packet_size);
-
-        if (packet_size > MAX_PACKET_SIZE) {
-            fprintf(stderr, "Packet too large: %u\n", packet_size);
+    while (true) {
+        int read_count = read(client_fd, buff, 48000 * 2 * sizeof(float) + 128);
+        if (read_count <= 0) {
             break;
         }
 
-        // Read Opus data
-        if (read_all(client_fd, buff, packet_size) != packet_size) break;
-
-        // Prepare new packet for other clients
-        uint32_t count = 1;
-        struct AudioPacketHeader header = {
-            .offset = 0,
-            .size = packet_size
-        };
-
-        // Network byte order conversion
-        uint32_t count_net = htonl(count);
-        uint32_t offset_net = htonl(header.offset);
-        uint32_t size_net = htonl(header.size);
-
-        // Construct new packet data (excluding leading size)
-        size_t new_data_size = sizeof(count) + sizeof(header) + packet_size;
-        unsigned char new_packet_data[sizeof(count) + sizeof(header) + MAX_PACKET_SIZE];
-        memcpy(new_packet_data, &count_net, sizeof(count));
-        memcpy(new_packet_data + sizeof(count), &offset_net, sizeof(header.offset));
-        memcpy(new_packet_data + sizeof(count) + sizeof(header.offset), &size_net, sizeof(header.size));
-        memcpy(new_packet_data + sizeof(count) + sizeof(header), buff, packet_size);
-
-        // Send to all other clients
         pthread_mutex_lock(&clients_mutex);
-        for (int i = 0; i < MAX_CLIENTS; ++i) {
-            if ((clients[i].active && i != client_index) || (client_count == 1 && echoMode)) {
-                // Send size prefix
-                uint32_t new_size_net = htonl(new_data_size);
-                if (send_all(clients[i].fd, &new_size_net, sizeof(new_size_net)) != sizeof(new_size_net)) {
-                    pthread_mutex_unlock(&clients_mutex);
-                    break;
-                }
-
-                // Send new packet data
-                if (send_all(clients[i].fd, new_packet_data, new_data_size) != new_data_size) {
+        
+        if (client_count == 1 && echoMode) {
+            // Echo mode - single client
+            if (write(client_fd, buff, read_count) <= 0) {
+                pthread_mutex_unlock(&clients_mutex);
+                break;
+            }
+        } else if (client_count == 2) {
+            // Forward mode - send to other client
+            int other_index = (client_index == 0) ? 1 : 0;
+            if (clients[other_index].active) {
+                if (write(clients[other_index].fd, buff, read_count) <= 0) {
                     pthread_mutex_unlock(&clients_mutex);
                     break;
                 }
             }
         }
+        
         pthread_mutex_unlock(&clients_mutex);
     }
 

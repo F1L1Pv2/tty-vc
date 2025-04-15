@@ -10,7 +10,6 @@
 
 #ifdef _WIN32
 #define NOMINMAX
-#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -25,14 +24,13 @@
 
 #include <stdlib.h>
 
-#include "common.h"
-
 #define BUFFER_SIZE 1024
 #define SAMPLE_RATE 48000  // Opus native sample rate
 #define CHANNELS 1
 #define FRAME_SIZE 960     // 20ms frames at 48kHz
 #define JITTER_BUFFER_SIZE 8 // packets of buffering to handle network jitter
 #define OPUS_APPLICATION OPUS_APPLICATION_VOIP
+#define MAX_PACKET_SIZE 1500
 
 void init_sockets() {
 #ifdef _WIN32
@@ -147,7 +145,6 @@ std::atomic<bool> running{true};
 
 struct AudioPacket {
     std::vector<unsigned char> data; // Compressed Opus data
-    std::vector<AudioPacketHeader> headers;
     std::chrono::steady_clock::time_point timestamp;
 };
 
@@ -259,25 +256,32 @@ void playback_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma
     (void)pInput; // Unused in playback callback
     
     AudioPacket packet;
-    memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
     if (jitterBuffer.pop(packet)) {
-        for(auto& header: packet.headers){
-            float pcm_data[FRAME_SIZE * CHANNELS];
-            int decoded_samples = opus_decode_float(decoder, 
-                                                  packet.data.data()+header.offset,
-                                                  header.size, 
-                                                  pcm_data, 
-                                                  FRAME_SIZE, 
-                                                  0);
+        float pcm_data[FRAME_SIZE * CHANNELS];
+        int decoded_samples = opus_decode_float(decoder, 
+                                              packet.data.data(), 
+                                              packet.data.size(), 
+                                              pcm_data, 
+                                              FRAME_SIZE, 
+                                              0);
+        
+        if (decoded_samples > 0) {
+            size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
+                                           static_cast<size_t>(frameCount * CHANNELS));
+            memcpy(pOutput, pcm_data, samplesToCopy * sizeof(float));
             
-            if (decoded_samples > 0) {
-                size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
-                                               static_cast<size_t>(frameCount * CHANNELS));
-                for(size_t iter = 0; iter < samplesToCopy; iter++){
-                    ((float*)pOutput)[iter] += pcm_data[iter];
-                }
+            // If we didn't get enough samples, fill the rest with silence
+            if (samplesToCopy < frameCount * CHANNELS) {
+                memset(reinterpret_cast<float*>(pOutput) + samplesToCopy, 0, 
+                      (frameCount * CHANNELS - samplesToCopy) * sizeof(float));
             }
+        } else {
+            fprintf(stderr, "Opus decode error: %s\n", opus_strerror(decoded_samples));
+            memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
         }
+    } else {
+        // No data available - output silence
+        memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
     }
 }
 
@@ -288,37 +292,13 @@ void receive_audio_data() {
         size_t bytes_received = receive_data(sock, reinterpret_cast<char*>(receive_buffer.data()), 
                                             receive_buffer.size());
         if (bytes_received > 0) {
-            const char* data_ptr = reinterpret_cast<const char*>(receive_buffer.data());
-            
-            // Read the count of headers
-            uint32_t header_count;
-            memcpy(&header_count, data_ptr, sizeof(header_count));
-            header_count = ntohl(header_count);
-            data_ptr += sizeof(header_count);
-            
-            // Read each header
-            std::vector<AudioPacketHeader> headers;
-            for (uint32_t i = 0; i < header_count; ++i) {
-                AudioPacketHeader header;
-                memcpy(&header.offset, data_ptr, sizeof(header.offset));
-                header.offset = ntohl(header.offset);
-                data_ptr += sizeof(header.offset);
-                memcpy(&header.size, data_ptr, sizeof(header.size));
-                header.size = ntohl(header.size);
-                data_ptr += sizeof(header.size);
-                headers.push_back(header);
-            }
-            
-            // The remaining data is the concatenated Opus packets
-            size_t opus_data_size = bytes_received - (data_ptr - reinterpret_cast<const char*>(receive_buffer.data()));
             AudioPacket packet;
-            packet.data.assign(reinterpret_cast<const unsigned char*>(data_ptr), 
-                              reinterpret_cast<const unsigned char*>(data_ptr) + opus_data_size);
-            packet.headers = std::move(headers);
+            packet.data.assign(receive_buffer.begin(), receive_buffer.begin() + bytes_received);
             packet.timestamp = std::chrono::steady_clock::now();
             
             jitterBuffer.push(std::move(packet));
         } else if (bytes_received == 0) {
+            // Connection closed
             running = false;
             break;
         }
