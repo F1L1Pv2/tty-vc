@@ -2,6 +2,7 @@
 #include <atomic>
 #include <thread>
 #include <queue>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 #include <vector>
@@ -156,6 +157,7 @@ private:
     size_t max_size;
     
 public:
+    JitterBuffer(): max_size(JITTER_BUFFER_SIZE) {}
     JitterBuffer(size_t size) : max_size(size) {}
     
     void push(AudioPacket&& packet) {
@@ -190,7 +192,8 @@ public:
     }
 };
 
-JitterBuffer jitterBuffer(JITTER_BUFFER_SIZE);
+std::map<uint32_t, JitterBuffer> jitterBuffers;
+std::mutex jitterBuffersMutex;
 
 // Opus encoder and decoder
 OpusEncoder* encoder = nullptr;
@@ -253,35 +256,22 @@ void capture_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_
 
 // Playback callback for headphone output
 void playback_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
-    (void)pInput; // Unused in playback callback
-    
-    AudioPacket packet;
-    if (jitterBuffer.pop(packet)) {
-        float pcm_data[FRAME_SIZE * CHANNELS];
-        int decoded_samples = opus_decode_float(decoder, 
-                                              packet.data.data(), 
-                                              packet.data.size(), 
-                                              pcm_data, 
-                                              FRAME_SIZE, 
-                                              0);
-        
-        if (decoded_samples > 0) {
-            size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
-                                           static_cast<size_t>(frameCount * CHANNELS));
-            memcpy(pOutput, pcm_data, samplesToCopy * sizeof(float));
-            
-            // If we didn't get enough samples, fill the rest with silence
-            if (samplesToCopy < frameCount * CHANNELS) {
-                memset(reinterpret_cast<float*>(pOutput) + samplesToCopy, 0, 
-                      (frameCount * CHANNELS - samplesToCopy) * sizeof(float));
+    std::lock_guard<std::mutex> lock(jitterBuffersMutex);
+    memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
+    for (auto& pair : jitterBuffers) {
+        AudioPacket packet;
+        if (pair.second.pop(packet)) {
+            float pcm[FRAME_SIZE * CHANNELS];
+            int decoded = opus_decode_float(decoder, packet.data.data(), packet.data.size(),
+                                           pcm, FRAME_SIZE, 0);
+            if (decoded > 0) {
+                for (size_t i = 0; i < FRAME_SIZE * CHANNELS; ++i) {
+                    ((float*)pOutput)[i] += pcm[i];
+                    // Clamp to prevent clipping
+                    ((float*)pOutput)[i] = std::max(-1.0f, std::min(1.0f, ((float*)pOutput)[i]));
+                }
             }
-        } else {
-            fprintf(stderr, "Opus decode error: %s\n", opus_strerror(decoded_samples));
-            memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
         }
-    } else {
-        // No data available - output silence
-        memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
     }
 }
 
@@ -291,16 +281,20 @@ void receive_audio_data() {
     while (running) {
         size_t bytes_received = receive_data(sock, reinterpret_cast<char*>(receive_buffer.data()), 
                                             receive_buffer.size());
-        if (bytes_received > 0) {
+        if (bytes_received >= 4) {
+            uint32_t sender_id;
+            memcpy(&sender_id, receive_buffer.data(), sizeof(sender_id));
+            sender_id = ntohl(sender_id);
+            size_t data_size = bytes_received - sizeof(sender_id);
+            const unsigned char* opus_data = receive_buffer.data() + sizeof(sender_id);
+
             AudioPacket packet;
-            packet.data.assign(receive_buffer.begin(), receive_buffer.begin() + bytes_received);
+            packet.data.assign(opus_data, opus_data + data_size);
             packet.timestamp = std::chrono::steady_clock::now();
-            
-            jitterBuffer.push(std::move(packet));
-        } else if (bytes_received == 0) {
-            // Connection closed
-            running = false;
-            break;
+
+            std::lock_guard<std::mutex> lock(jitterBuffersMutex);
+            auto& buffer = jitterBuffers[sender_id];
+            buffer.push(std::move(packet));
         }
     }
 }
@@ -402,17 +396,19 @@ int main(int argc, char* argv[]) {
     // Main loop
     while (running) {
         // Monitor jitter buffer fill level
-        size_t buffer_size = jitterBuffer.size();
-        if (buffer_size < 1) {
-            // Buffer underrun - we might want to increase buffer size
-            // printf("Warning: Jitter buffer underrun (%zu packets)\n", buffer_size);
-        } else if (buffer_size > JITTER_BUFFER_SIZE * 2) {
-            // Buffer overrun - we might want to drop some packets
-            // printf("Warning: Jitter buffer overrun (%zu packets)\n", buffer_size);
-            jitterBuffer.clear();
+        for(auto& [id,jitterBuffer] : jitterBuffers){
+            size_t buffer_size = jitterBuffer.size();
+            if (buffer_size < 1) {
+                // Buffer underrun - we might want to increase buffer size
+                // printf("Warning: Jitter buffer underrun (%zu packets)\n", buffer_size);
+            } else if (buffer_size > JITTER_BUFFER_SIZE * 2) {
+                // Buffer overrun - we might want to drop some packets
+                // printf("Warning: Jitter buffer overrun (%zu packets)\n", buffer_size);
+                jitterBuffer.clear();
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     // Cleanup
