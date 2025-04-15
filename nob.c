@@ -262,7 +262,6 @@ int main(int argc, char** argv){
            "clang++",
            "-g",
            "src/client.cpp",
-           "-std=c++17",
            "-o",
 #ifdef _WIN32
            "build/client.exe",

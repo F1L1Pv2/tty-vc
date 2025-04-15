@@ -12,71 +12,70 @@
 #define NOB_IMPLEMENATION
 #include "../nob.h"
 
-#define MAX_CLIENTS 10
-#define MAX_PACKET_SIZE 1500
-
+#define MAX_CLIENTS 2
 
 typedef struct {
     int fd;
     struct sockaddr_in addr;
-    int id;  // Using client index as ID
+    int index;
     bool active;
     pthread_t thread_id;
 } client_info;
+
+
+bool echoMode = false;
 
 client_info clients[MAX_CLIENTS];
 int client_count = 0;
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-size_t send_data(int sock, const char *data, size_t size) {
-    uint32_t packet_size = htonl(size);
-    if (send(sock, &packet_size, sizeof(packet_size), 0) != sizeof(packet_size)) {
-        perror("send packet size failed");
-        return 0;
-    }
-    return send(sock, data, size, 0);
-}
-
-size_t receive_data(int sock, char *buffer, size_t buffer_size) {
-    uint32_t packet_size;
-    if (recv(sock, &packet_size, sizeof(packet_size), 0) != sizeof(packet_size)) {
-        perror("recv packet size failed");
-        return 0;
-    }
-    packet_size = ntohl(packet_size);
-    if (packet_size > buffer_size) {
-        fprintf(stderr, "Packet too large: %u > %zu\n", packet_size, buffer_size);
-        return 0;
-    }
-    return recv(sock, buffer, packet_size, 0);
-}
-
 void *handle_client(void *arg) {
     client_info *client = (client_info *)arg;
-    char data_buffer[MAX_PACKET_SIZE];
-    
-    while (true) {
-        size_t data_size = receive_data(client->fd, data_buffer, sizeof(data_buffer));
-        if (data_size <= 0) break;
+    int client_fd = client->fd;
+    int client_index = client->index;
 
-        // Prepend client ID to data
-        uint32_t sender_id = htonl(client->id);
-        char combined[4 + data_size];
-        memcpy(combined, &sender_id, 4);
-        memcpy(combined + 4, data_buffer, data_size);
+    printf("Thread started for client %d\n", client_index);
+    
+    float* buff = (float*)malloc(48000 * 2 * sizeof(float) + 128);
+    if (!buff) {
+        perror("malloc failed");
+        goto cleanup;
+    }
+
+    while (true) {
+        int read_count = read(client_fd, buff, 48000 * 2 * sizeof(float) + 128);
+        if (read_count <= 0) {
+            break;
+        }
 
         pthread_mutex_lock(&clients_mutex);
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].active && clients[i].id != client->id) {
-                send_data(clients[i].fd, combined, sizeof(combined));
+        
+        if (client_count == 1 && echoMode) {
+            // Echo mode - single client
+            if (write(client_fd, buff, read_count) <= 0) {
+                pthread_mutex_unlock(&clients_mutex);
+                break;
+            }
+        } else if (client_count == 2) {
+            // Forward mode - send to other client
+            int other_index = (client_index == 0) ? 1 : 0;
+            if (clients[other_index].active) {
+                if (write(clients[other_index].fd, buff, read_count) <= 0) {
+                    pthread_mutex_unlock(&clients_mutex);
+                    break;
+                }
             }
         }
+        
         pthread_mutex_unlock(&clients_mutex);
     }
 
-    printf("Client %d disconnected\n", client->id);
+cleanup:
+    printf("Client %d disconnected\n", client_index);
+    free(buff);
+    
     pthread_mutex_lock(&clients_mutex);
-    close(client->fd);
+    close(client_fd);
     client->active = false;
     client_count--;
     pthread_mutex_unlock(&clients_mutex);
@@ -101,6 +100,13 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
+    while (argc > 0){
+        char* arg = nob_shift_args(&argc,&argv);
+        if(strcmp(arg, "echo") == 0){
+            echoMode = true;
+        }
+    }
+
     int server_fd;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
@@ -110,7 +116,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].fd = -1;
         clients[i].active = false;
-        clients[i].id = i;
+        clients[i].index = i;
     }
 
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
@@ -151,8 +157,8 @@ int main(int argc, char** argv) {
         int client_fd;
         struct sockaddr_in client_addr;
         socklen_t client_addrlen = sizeof(client_addr);
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen);
-        if (client_fd < 0) {
+
+        if ((client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addrlen)) < 0) {
             perror("accept failed");
             continue;
         }
@@ -160,21 +166,29 @@ int main(int argc, char** argv) {
         pthread_mutex_lock(&clients_mutex);
         
         if (client_count >= MAX_CLIENTS) {
-            printf("Rejected connection (max clients reached)\n");
+            printf("Rejected connection from %s:%d (max clients reached)\n", 
+                  inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
             close(client_fd);
             pthread_mutex_unlock(&clients_mutex);
             continue;
         }
 
+        // Find empty slot
         int client_index = -1;
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (!clients[i].active) {
                 client_index = i;
-                clients[i].id = i;
                 break;
             }
         }
 
+        if (client_index == -1) {
+            close(client_fd);
+            pthread_mutex_unlock(&clients_mutex);
+            continue;
+        }
+
+        // Store client info
         clients[client_index].fd = client_fd;
         clients[client_index].addr = client_addr;
         clients[client_index].active = true;
@@ -184,12 +198,14 @@ int main(int argc, char** argv) {
               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port),
               client_count, MAX_CLIENTS);
 
+        // Create thread
         if (pthread_create(&clients[client_index].thread_id, NULL, handle_client, &clients[client_index]) != 0) {
             perror("pthread_create failed");
             clients[client_index].active = false;
             client_count--;
             close(client_fd);
         } else {
+            // Detach the thread so we don't need to join it later
             pthread_detach(clients[client_index].thread_id);
         }
         
