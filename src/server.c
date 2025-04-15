@@ -10,7 +10,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #define NOB_IMPLEMENATION
-#include "../../nob.h"
+#include "../nob.h"
 
 #define MAX_CLIENTS 2
 
