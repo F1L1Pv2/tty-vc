@@ -2,8 +2,6 @@
 #include <atomic>
 #include <thread>
 #include <queue>
-#include <mutex>
-#include <condition_variable>
 #include <vector>
 #include <chrono>
 #include <opusfile/include/opusfile.h>
@@ -22,6 +20,7 @@
 #include <netdb.h>
 #endif
 
+#include "RingBuffer.h"
 #include <stdlib.h>
 
 #define BUFFER_SIZE 1024
@@ -145,52 +144,10 @@ std::atomic<bool> running{true};
 
 struct AudioPacket {
     std::vector<unsigned char> data; // Compressed Opus data
-    std::chrono::steady_clock::time_point timestamp;
 };
 
-class JitterBuffer {
-private:
-    std::queue<AudioPacket> buffer;
-    std::mutex mtx;
-    std::condition_variable cv;
-    size_t max_size;
-    
-public:
-    JitterBuffer(size_t size) : max_size(size) {}
-    
-    void push(AudioPacket&& packet) {
-        std::unique_lock<std::mutex> lock(mtx);
-        if (buffer.size() >= max_size) {
-            buffer.pop(); // Drop oldest packet if buffer is full
-        }
-        buffer.push(std::move(packet));
-        cv.notify_one();
-    }
-    
-    bool pop(AudioPacket& packet) {
-        std::unique_lock<std::mutex> lock(mtx);
-        if (buffer.empty()) {
-            return false;
-        }
-        packet = std::move(buffer.front());
-        buffer.pop();
-        return true;
-    }
-    
-    void clear() {
-        std::unique_lock<std::mutex> lock(mtx);
-        while (!buffer.empty()) {
-            buffer.pop();
-        }
-    }
-    
-    size_t size() {
-        std::unique_lock<std::mutex> lock(mtx);
-        return buffer.size();
-    }
-};
 
-JitterBuffer jitterBuffer(JITTER_BUFFER_SIZE);
+ContigousAsyncBuffer jitterBuffer(8,sizeof(AudioPacket));
 
 // Opus encoder and decoder
 OpusEncoder* encoder = nullptr;
@@ -255,24 +212,24 @@ void capture_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_
 void playback_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
     (void)pInput; // Unused in playback callback
     
-    AudioPacket packet;
     memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
-    if (jitterBuffer.pop(packet)) {
-        float pcm_data[FRAME_SIZE * CHANNELS];
-        int decoded_samples = opus_decode_float(decoder, 
-                                              packet.data.data(), 
-                                              packet.data.size(), 
-                                              pcm_data,
-                                              FRAME_SIZE, 
-                                              0);
+    AudioPacket* packet = (AudioPacket*)jitterBuffer.read();
+    if(!packet) return;
+
+    float pcm_data[FRAME_SIZE * CHANNELS];
+    int decoded_samples = opus_decode_float(decoder, 
+                                        packet->data.data(), 
+                                        packet->data.size(), 
+                                        pcm_data,
+                                        FRAME_SIZE, 
+                                        0);
         
-        if (decoded_samples > 0) {
-            size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
-                                           static_cast<size_t>(frameCount * CHANNELS));
-            memcpy(pOutput, pcm_data, samplesToCopy * sizeof(float)); 
-        } else {
-            fprintf(stderr, "Opus decode error: %s\n", opus_strerror(decoded_samples));
-        }
+    if (decoded_samples > 0) {
+        size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
+                                       static_cast<size_t>(frameCount * CHANNELS));
+        memcpy(pOutput, pcm_data, samplesToCopy * sizeof(float)); 
+    } else {
+        fprintf(stderr, "Opus decode error: %s\n", opus_strerror(decoded_samples));
     }
 }
 
@@ -285,9 +242,8 @@ void receive_audio_data() {
         if (bytes_received > 0) {
             AudioPacket packet;
             packet.data.assign(receive_buffer.begin(), receive_buffer.begin() + bytes_received);
-            packet.timestamp = std::chrono::steady_clock::now();
             
-            jitterBuffer.push(std::move(packet));
+            jitterBuffer.write(&packet, 1);
         } else if (bytes_received == 0) {
             // Connection closed
             running = false;
@@ -393,16 +349,6 @@ int main(int argc, char* argv[]) {
     // Main loop
     while (running) {
         // Monitor jitter buffer fill level
-        size_t buffer_size = jitterBuffer.size();
-        if (buffer_size < 1) {
-            // Buffer underrun - we might want to increase buffer size
-            // printf("Warning: Jitter buffer underrun (%zu packets)\n", buffer_size);
-        } else if (buffer_size > JITTER_BUFFER_SIZE * 2) {
-            // Buffer overrun - we might want to drop some packets
-            // printf("Warning: Jitter buffer overrun (%zu packets)\n", buffer_size);
-            jitterBuffer.clear();
-        }
-        
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
