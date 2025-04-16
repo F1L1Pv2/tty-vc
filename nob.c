@@ -261,7 +261,6 @@ int main(int argc, char** argv){
         cmd_append(&cmd,
            "clang++",
            "-g",
-           "-std=c++17",
            "src/client.cpp",
            "-o",
 #ifdef _WIN32
