@@ -256,32 +256,23 @@ void playback_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma
     (void)pInput; // Unused in playback callback
     
     AudioPacket packet;
+    memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
     if (jitterBuffer.pop(packet)) {
         float pcm_data[FRAME_SIZE * CHANNELS];
         int decoded_samples = opus_decode_float(decoder, 
                                               packet.data.data(), 
                                               packet.data.size(), 
-                                              pcm_data, 
+                                              pcm_data,
                                               FRAME_SIZE, 
                                               0);
         
         if (decoded_samples > 0) {
             size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
                                            static_cast<size_t>(frameCount * CHANNELS));
-            memcpy(pOutput, pcm_data, samplesToCopy * sizeof(float));
-            
-            // If we didn't get enough samples, fill the rest with silence
-            if (samplesToCopy < frameCount * CHANNELS) {
-                memset(reinterpret_cast<float*>(pOutput) + samplesToCopy, 0, 
-                      (frameCount * CHANNELS - samplesToCopy) * sizeof(float));
-            }
+            memcpy(pOutput, pcm_data, samplesToCopy * sizeof(float)); 
         } else {
             fprintf(stderr, "Opus decode error: %s\n", opus_strerror(decoded_samples));
-            memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
         }
-    } else {
-        // No data available - output silence
-        memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
     }
 }
 
