@@ -23,6 +23,16 @@ std::atomic<bool> echoMode{false};
 std::atomic<int> clientCount{0};
 ClientInfo clients[MAX_CLIENTS];
 
+#include "concurrentqueue.h"
+
+struct SendPacket{
+    int fd = -1;
+    void* data = nullptr;
+    size_t size = 0;
+};
+
+moodycamel::ConcurrentQueue<SendPacket> queue;
+
 size_t send_data(int sock, void *data, size_t size) {
     // First send the size of the packet (4 bytes)
     uint32_t packet_size = htonl(static_cast<uint32_t>(size));
@@ -68,39 +78,48 @@ void handle_client(ClientInfo* client) {
 
     std::cout << "Thread started for client " << client_index << std::endl;
     
-    char* buff = new char[MAX_PACKET_SIZE];
-    if (!buff) {
-        perror("malloc failed");
-        goto cleanup;
-    }
+    char* buff = nullptr;
 
     while (true) {
-        int read_count = receive_data(client->fd, buff, MAX_PACKET_SIZE);
+        buff = new char[sizeof(uint32_t)+MAX_PACKET_SIZE];
+        int read_count = receive_data(client->fd, buff+sizeof(uint32_t),MAX_PACKET_SIZE);
         if (read_count <= 0) break;
 
-        if (clientCount == 1 && echoMode) {
-            // Echo mode - single client
-            if (send_data(client->fd, buff, read_count) <= 0) {
-                break;
-            }
-        } else if (clientCount == 2) {
-            // Forward mode - send to other client
-            int other_index = (client_index == 0) ? 1 : 0;
-            if (clients[other_index].active) {
-                if (send_data(clients[other_index].fd, buff, read_count) <= 0) {
-                    break;
-                }
-            }
-        }
+        ((uint32_t*)buff)[0] = client->index.load();
+
+        SendPacket packet;
+        packet.fd = client->fd;
+        packet.data = buff;
+        packet.size = sizeof(uint32_t)+read_count;
+        queue.enqueue(packet);
     }
 
 cleanup:
     std::cout << "Client " << client_index << " disconnected" << std::endl;
-    delete[] buff;
+    if(buff) delete[] buff;
     
     close(client_fd);
     client->active = false;
     clientCount--;
+}
+
+void sender(){
+    SendPacket packet;
+    while(true){
+        if(!queue.try_dequeue(packet)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        if(packet.data == nullptr || packet.size == 0) continue;
+
+        for(int i = 0; i < MAX_CLIENTS; i++){
+            if(!clients[i].active.load()) continue;
+            if(clients[i].fd == packet.fd) continue;
+
+            send_data(clients[i].fd, packet.data, packet.size);
+        }
+    }
 }
 
 void usage(const std::string& program) {
@@ -168,6 +187,9 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Listening on " << hostname << ":" << port << "..." << std::endl;
+
+    auto broadcasterThread = std::thread(sender);
+    broadcasterThread.detach();
 
     while (true) {
         int client_fd;

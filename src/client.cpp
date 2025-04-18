@@ -147,7 +147,7 @@ struct AudioPacket {
     std::chrono::steady_clock::time_point timestamp;
 };
 
-moodycamel::ConcurrentQueue<AudioPacket> queue;
+moodycamel::ConcurrentQueue<AudioPacket> queues[MAX_CLIENTS];
 
 // Opus encoder and decoder
 OpusEncoder* encoder = nullptr;
@@ -214,37 +214,50 @@ void playback_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma
     
     AudioPacket packet;
     memset(pOutput, 0, frameCount * CHANNELS * sizeof(float));
-    if (queue.try_dequeue(packet)) {
-        float pcm_data[FRAME_SIZE * CHANNELS];
-        int decoded_samples = opus_decode_float(decoder, 
-                                              packet.data.data(), 
-                                              packet.data.size(), 
-                                              pcm_data,
-                                              FRAME_SIZE, 
-                                              0);
-        
-        if (decoded_samples > 0) {
-            size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
-                                           static_cast<size_t>(frameCount * CHANNELS));
-            memcpy(pOutput, pcm_data, samplesToCopy * sizeof(float)); 
-        } else {
-            fprintf(stderr, "Opus decode error: %s\n", opus_strerror(decoded_samples));
+    for(int i = 0; i < MAX_CLIENTS; i++){
+        if (queues[i].try_dequeue(packet)) {
+            float pcm_data[FRAME_SIZE * CHANNELS];
+            int decoded_samples = opus_decode_float(decoder, 
+                                                  packet.data.data(), 
+                                                  packet.data.size(), 
+                                                  pcm_data,
+                                                  FRAME_SIZE, 
+                                                  0);
+            
+            if (decoded_samples > 0) {
+                size_t samplesToCopy = std::min(static_cast<size_t>(decoded_samples * CHANNELS), 
+                                               static_cast<size_t>(frameCount * CHANNELS));
+                for(int i = 0; i < samplesToCopy; i++){
+                    ((float*)pOutput)[i] += pcm_data[i];
+                }
+            } else {
+                fprintf(stderr, "Opus decode error: %s\n", opus_strerror(decoded_samples));
+            }
         }
+    }
+
+    //clamping
+    for(int i = 0; i < frameCount * CHANNELS; i++){
+        if(((float*)pOutput)[i] < -1.0f) ((float*)pOutput)[i] = -1.0f;
+        if(((float*)pOutput)[i] >  1.0f) ((float*)pOutput)[i] =  1.0f;
     }
 }
 
 void receive_audio_data() {
-    std::vector<unsigned char> receive_buffer(MAX_PACKET_SIZE);
+    std::vector<unsigned char> receive_buffer(sizeof(uint32_t)+MAX_PACKET_SIZE);
     
     while (running) {
         size_t bytes_received = receive_data(sock, reinterpret_cast<char*>(receive_buffer.data()), 
                                             receive_buffer.size());
         if (bytes_received > 0) {
             AudioPacket packet;
-            packet.data.assign(receive_buffer.begin(), receive_buffer.begin() + bytes_received);
+            packet.data.assign(receive_buffer.begin()+sizeof(uint32_t), receive_buffer.begin() + bytes_received);
             packet.timestamp = std::chrono::steady_clock::now();
+
+            uint32_t client_index = *((uint32_t*)receive_buffer.data());
+            if(client_index > MAX_CLIENTS) continue;
             
-            queue.enqueue(packet);
+            queues[client_index].enqueue(packet);
         } else if (bytes_received == 0) {
             // Connection closed
             running = false;
