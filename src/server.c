@@ -11,8 +11,7 @@
 #include <sys/socket.h>
 #define NOB_IMPLEMENATION
 #include "../nob.h"
-
-#define MAX_CLIENTS 2
+#include "common.h"
 
 typedef struct {
     int fd;
@@ -29,6 +28,45 @@ client_info clients[MAX_CLIENTS];
 int client_count = 0;
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+size_t send_data(int sock, void *data, size_t size) {
+    // First send the size of the packet (4 bytes)
+    uint32_t packet_size = htonl((uint32_t)size);
+    if (send(sock, (const char*)&packet_size, sizeof(packet_size), 0) != sizeof(packet_size)) {
+        perror("Failed to send packet size");
+        return 0;
+    }
+    
+    // Then send the actual data
+    ssize_t bytes_sent = send(sock, data, size, 0);
+    if (bytes_sent < 0) {
+        perror("Send failed");
+    }
+    return (size_t)bytes_sent;
+}
+
+size_t receive_data(int sock, char *buffer, size_t buffer_size) {
+    // First receive the packet size
+    uint32_t packet_size;
+    if (recv(sock, (char*)&packet_size, sizeof(packet_size), 0) != sizeof(packet_size)) {
+        perror("Failed to receive packet size");
+        return 0;
+    }
+    packet_size = ntohl(packet_size);
+    
+    if (packet_size > buffer_size) {
+        fprintf(stderr, "Packet too large: %u > %zu\n", packet_size, buffer_size);
+        return 0;
+    }
+    
+    // Then receive the actual data
+    ssize_t bytes_received = recv(sock, buffer, packet_size, 0);
+    if (bytes_received < 0) {
+        perror("Receive failed");
+        return 0;
+    }
+    return (size_t)bytes_received;
+}
+
 void *handle_client(void *arg) {
     client_info *client = (client_info *)arg;
     int client_fd = client->fd;
@@ -36,23 +74,21 @@ void *handle_client(void *arg) {
 
     printf("Thread started for client %d\n", client_index);
     
-    float* buff = (float*)malloc(48000 * 2 * sizeof(float) + 128);
+    void* buff = (float*)malloc(MAX_PACKET_SIZE);
     if (!buff) {
         perror("malloc failed");
         goto cleanup;
     }
 
     while (true) {
-        int read_count = read(client_fd, buff, 48000 * 2 * sizeof(float) + 128);
-        if (read_count <= 0) {
-            break;
-        }
+        int read_count = receive_data(client->fd,(char*)buff,MAX_PACKET_SIZE);
+        if(read_count <= 0) break;
 
         pthread_mutex_lock(&clients_mutex);
         
         if (client_count == 1 && echoMode) {
             // Echo mode - single client
-            if (write(client_fd, buff, read_count) <= 0) {
+            if (send_data(client->fd,buff,read_count) <= 0) {
                 pthread_mutex_unlock(&clients_mutex);
                 break;
             }
@@ -60,7 +96,7 @@ void *handle_client(void *arg) {
             // Forward mode - send to other client
             int other_index = (client_index == 0) ? 1 : 0;
             if (clients[other_index].active) {
-                if (write(clients[other_index].fd, buff, read_count) <= 0) {
+                if (send_data(clients[other_index].fd,buff,read_count) <= 0) {
                     pthread_mutex_unlock(&clients_mutex);
                     break;
                 }
