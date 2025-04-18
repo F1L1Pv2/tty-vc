@@ -254,8 +254,11 @@ void receive_audio_data() {
             packet.data.assign(receive_buffer.begin()+sizeof(uint32_t), receive_buffer.begin() + bytes_received);
             packet.timestamp = std::chrono::steady_clock::now();
 
-            uint32_t client_index = *((uint32_t*)receive_buffer.data());
-            if(client_index > MAX_CLIENTS) continue;
+            uint32_t client_index = ((uint32_t*)receive_buffer.data())[0];
+            if(client_index > MAX_CLIENTS) {
+                printf("Invalid client id: %d\n", client_index);
+                client_index = client_index % MAX_CLIENTS;
+            }
             
             queues[client_index].enqueue(packet);
         } else if (bytes_received == 0) {

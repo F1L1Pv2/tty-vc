@@ -85,7 +85,7 @@ void handle_client(ClientInfo* client) {
         int read_count = receive_data(client->fd, buff+sizeof(uint32_t),MAX_PACKET_SIZE);
         if (read_count <= 0) break;
 
-        ((uint32_t*)buff)[0] = client->index.load();
+        ((uint32_t*)buff)[0] = (uint32_t)client->index.load();
 
         SendPacket packet;
         packet.fd = client->fd;
