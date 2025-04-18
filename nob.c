@@ -287,7 +287,7 @@ int main(int argc, char** argv){
 #ifndef _WIN32
     needs_rebuild1(
         "build/server",
-        "src/server.c"
+        "src/server.cpp"
     );
 #else
     1;
@@ -299,7 +299,7 @@ int main(int argc, char** argv){
 #ifndef _WIN32
         cmd.count = 0;
 
-        cmd_append(&cmd, "clang", "src/server.c", "-o", "build/server");
+        cmd_append(&cmd, "clang++", "src/server.cpp", "-o", "build/server");
         if(!cmd_run_sync_and_reset(&cmd)) return 1;
 #else
         printf("Building server on windows is not supported (who would use windows for server anyways)\n");
